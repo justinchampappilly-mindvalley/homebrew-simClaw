@@ -1,0 +1,3046 @@
+#!/bin/bash
+# sim.sh
+#
+# Standalone CLI tool for interacting with a running iOS Simulator.
+# Uses WebDriverAgent (WDA) for touch injection and xcrun simctl.
+# WDA runs inside each simulator via XCUITest, connected via UDID-scoped
+# testmanagerd socket — no window-focus dependency, parallel-tap safe.
+#
+# ── QUICK START FOR AI AGENTS ─────────────────────────────────────────────────
+#
+# STEP 0 — Start WDA (required once per simulator session, before any tap/swipe):
+#   sim.sh --device <UDID> wda-start <port>
+#   WDA (WebDriverAgent) runs inside the simulator as an XCUITest runner.
+#   All taps and swipes are routed through WDA's W3C Actions API →
+#   XCTest → testmanagerd → synthetic IOHIDEvent. This is fully UDID-scoped
+#   (no window focus dependency) so parallel taps to different simulators work.
+#   Each simulator needs its own port (e.g. 8100, 8101). The session ID is
+#   cached automatically in /tmp/sim_bootstrap_cache_<UDID>.json.
+#   You do NOT need a global queue or serialization — taps are already isolated.
+#
+# STEP 1 — Call `layout-map` on any screen — it returns everything you need in
+#   one shot: screen title, back button, tab bar, all interactive elements,
+#   visible text, scroll hints, a context classifier, and suggested_actions
+#   with pre-validated labels ready for your next tap-and-wait call.
+#
+# STEP 2 — Use `tap-and-wait` to navigate in a single tool call:
+#   it finds the element by label, taps it, waits for the next screen,
+#   then returns a fresh layout-map of the resulting screen.
+#   This collapses find-element + tap + wait-for + layout-map into ONE call.
+#
+# STEP 3 — Batch all sequential commands into ONE Bash tool call using &&.
+#   Each separate Bash tool call costs ~10s of API round-trip latency on top
+#   of the ~1–2s the command itself takes. Batching 20 calls into 5 cuts
+#   total time from ~240s to ~60s.
+#
+# PERFORMANCE GUIDE — compound navigation with tap-and-wait:
+#
+#   OLD pattern (5 separate tool calls per navigation step):
+#     call 1: sim.sh layout-map               ← read screen
+#     call 2: sim.sh find-element "Sign In"   ← find element
+#     call 3: sim.sh tap 196 420              ← tap
+#     call 4: sim.sh wait-for "Home" 10       ← wait
+#     call 5: sim.sh layout-map               ← read new screen
+#
+#   NEW pattern (2 tool calls total for the same navigation step):
+#     call 1: sim.sh layout-map                                  ← read screen
+#     call 2: sim.sh tap-and-wait "Sign In" "Home" 10            ← tap + wait + read new screen
+#
+#   Taps are UDID-scoped via WDA — no global serialization needed. Two simulators
+#   can receive taps concurrently without interfering with each other.
+#
+#   Use labels from suggested_actions in your tap-and-wait calls — they are
+#   pre-validated as present on screen and will match without fuzzy search.
+#
+# layout-map output schema:
+#   {
+#     "screen": "Account",          -- nav title; "~text" = heuristic; "unknown" = modal/sheet
+#     "modal": false,               -- true when no nav bar + close button present
+#     "navigation": {
+#       "title": "Account",
+#       "back": {"label":"icoBack","x":27,"y":76},   -- null if no back button
+#       "tabs": [{"label":"Today","x":39,"y":795,"selected":true}, ...]
+#     },
+#     "interactive": [              -- x,y are TOP-LEFT; tap center = x+w/2, y+h/2
+#       {"role":"AXButton","label":"View Profile","x":33,"y":234,"w":121,"h":40,"value":null,"enabled":true}
+#     ],
+#     "content": {
+#       "headings": [],
+#       "texts": ["Justin Champappilly", "2", "DAY STREAK", ...]
+#     },
+#     "scroll": {
+#       "vertical": true,           -- true if scrollable content exists
+#       "horizontal": false,
+#       "above_fold": [],           -- labels of interactive/heading elements above current view
+#       "below_fold": ["Library","Favorites","Downloads"]  -- labels reachable by scrolling down
+#     },
+#     "context": "tab_screen",      -- screen type classifier:
+#                                   --   "media_player" | "modal_sheet" | "search" | "form"
+#                                   --   "tab_screen" | "list" | "detail_screen" | "unknown"
+#     "suggested_actions": [        -- pre-validated labels ready for tap-and-wait; prefer these
+#       "tap 'View Profile' at (93, 254)",
+#       "tap tab 'Library' at (196, 795)",
+#       "scroll down to reveal: Favorites, Downloads",
+#       "tap back 'icoBack' at (27, 76) to return"
+#     ]
+#   }
+#
+# Only split into separate Bash tool calls when you need to inspect output to
+# decide what to run next. Otherwise chain everything with &&.
+#
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# Requirements:
+#   - Xcode Simulator running with a booted device
+#   - macOS Accessibility permission granted to Terminal/iTerm (System Settings > Privacy & Security > Accessibility)
+#   - xcrun (Xcode command-line tools)
+#   - jq (brew install jq)
+#   - swift (included with Xcode)
+
+set -euo pipefail
+
+# ── Globals (populated by detect_* functions) ──────────────────────────────────
+SIM_UDID=""
+SIM_NAME=""
+SIM_DEVICE_TYPE=""
+SIM_OS=""
+SIM_LOGICAL_W=""
+SIM_LOGICAL_H=""
+SIM_SCALE=""
+SIM_SCREEN_X=""
+SIM_SCREEN_Y=""
+SIM_SCREEN_W=""
+SIM_SCREEN_H=""
+SIM_ZOOM=""
+SIM_TARGET_UDID=""
+WDA_PORT=""
+WDA_SESSION=""
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+die() { echo "ERROR: $*" >&2; exit 1; }
+
+usage() {
+  cat <<'EOF'
+Usage: sim.sh [--device <UDID>] <command> [args]
+
+Options:
+  --device <UDID>    Target a specific simulator by UDID (default: most recently booted)
+
+── START HERE (AI agents) ────────────────────────────────────────────────────
+
+  layout-map                              ★ Call this first on any screen. Returns a single
+                                            JSON snapshot: screen title, back button, tab bar,
+                                            all interactive elements (with top-left x,y,w,h),
+                                            visible text, below/above-fold scroll labels,
+                                            a "context" string classifying the screen type
+                                            (e.g. "media_player", "home", "settings"), and
+                                            "suggested_actions": an array of human-readable
+                                            strings like "tap 'Label' at (x, y)" and
+                                            "scroll down to reveal: ...".
+                                            Labels in suggested_actions are pre-validated as
+                                            present on screen — prefer them in your next
+                                            tap-and-wait call over labels you derive yourself.
+                                            Replaces screen-title + describe + find-element.
+
+  tap-and-wait <label> [expected] [secs]  ★ Compound navigation in one call. Finds element by
+                                            label, taps it, optionally waits for <expected>
+                                            element to appear (default timeout 10s), then
+                                            returns a full layout-map of the resulting screen.
+                                            Replaces find-element + tap + wait-for + layout-map
+                                            (4 separate calls → 1 call).
+                                            Usage: tap-and-wait "Sign In" "Home" 10
+                                            Example: tap-and-wait "View Profile" "Profile" 8
+
+── Interaction ───────────────────────────────────────────────────────────────
+
+  tap <x> <y>                             Tap at iOS logical coordinates
+  tap-element <label>                     Tap a UI element by its accessibility label
+  swipe <x1> <y1> <x2> <y2> [steps] [ms] Swipe between two points
+  scroll-up [x] [from_y] [to_y]          Scroll up (finger moves up = content scrolls down)
+  scroll-down [x] [from_y] [to_y]        Scroll down
+  scroll-to-visible <label> [max_swipes]  Scroll until element is visible (default 10 swipes)
+  type <text>                             Type text into focused field. Uses WDA setValue (preferred)
+                                          if WDA is running, else falls back to AX direct-value API
+
+── Waiting ───────────────────────────────────────────────────────────────────
+
+  wait-for <label> [timeout]              Block until element appears (default: 10s, event-driven)
+  wait-for-stable [timeout]              Block until UI stops changing (default: 5s)
+
+── Inspection (use when layout-map isn't enough) ─────────────────────────────
+
+  screen-title                            Current screen/nav title only
+  find-element <label>                    Find element by label → JSON {role,label,x,y,w,h} or exit 1
+  describe-point <x> <y>                  Hit-test AX element at coordinate → JSON (works on tab bars)
+  describe [depth] [--interactive|-i]     Dump AX tree as JSON; --interactive = buttons/links only
+  screenshot <output.png>                 Capture screen to PNG (use sparingly — prefer AX commands)
+
+── WDA (WebDriverAgent) ──────────────────────────────────────────────────────
+
+  setup <app_path_or_bundle_id>           ★ One-shot setup: boots simulator, builds WDA (if
+        [--port <wda_port>]               needed), installs app (if .app path given), starts
+                                          WDA, and launches the app. Run once to go from a
+                                          cold state to a fully interactive session.
+                                          If app_path ends in .app it is installed via simctl;
+                                          otherwise the argument is treated as a bundle ID
+                                          (app assumed already installed). Default port: 8100.
+                                          Requires /tmp/WebDriverAgent to be cloned first.
+                                          Usage: sim.sh --device <UDID> setup /path/to/App.app
+                                                 sim.sh --device <UDID> setup com.example.app --port 8101
+
+  wda-start [port]                        ★ REQUIRED before any tap or swipe command.
+                                          Starts WDA inside the target simulator using a
+                                          pre-built binary from /tmp/WDA_DerivedData, then
+                                          creates a W3C session and caches the port + session
+                                          ID in /tmp/sim_bootstrap_cache_<UDID>.json.
+                                          Each simulator needs its own port (default 8100).
+                                          Run once per simulator session; subsequent taps
+                                          reuse the cached session automatically.
+                                          Usage: sim.sh --device <UDID> wda-start 8100
+
+── Diagnostics ───────────────────────────────────────────────────────────────
+
+  status                                  Print booted device info and screen bounds
+
+All x/y coordinates are iOS logical points.
+Tap center of a layout-map element: x + w/2, y + h/2
+
+── Agent pattern (fewest tool calls) ─────────────────────────────────────────
+
+  STARTING FROM SCRATCH (cold simulator or unknown state):
+
+  # Step 0 — one-shot setup: boots sim, builds WDA if needed, installs + launches app:
+  sim.sh --device <UDID> setup /path/to/App.app
+  # or, if app is already installed:
+  sim.sh --device <UDID> setup com.example.myapp --port 8100
+
+  STARTING FROM A WARM SESSION (sim already booted, app installed, WDA may be running):
+
+  # Step 0 — start WDA only (skip if setup was already run):
+  sim.sh --device <UDID> wda-start 8100
+
+  THEN NAVIGATE (applies to both flows above):
+
+  # Step 1 — understand current screen (includes suggested_actions):
+  sim.sh --device <UDID> layout-map
+
+  # Step 2 — navigate using tap-and-wait (find + tap + wait + read = 1 call):
+  sim.sh --device <UDID> tap-and-wait "Sign In" "Home" 10
+
+  # Step 3 — navigate again using a label from the new layout-map's suggested_actions:
+  sim.sh --device <UDID> tap-and-wait "View Profile" "Profile" 8
+
+  # tip: tap-and-wait + layout-map together enable compound navigation steps —
+  # each call does: find element + tap + wait for next screen + read new screen.
+  # This is 1 tool call instead of 4 (find-element + tap + wait-for + layout-map).
+
+  # When tap-and-wait is not suitable (e.g. raw coordinate tap), use:
+  sim.sh --device <UDID> tap 35 81 && sim.sh --device <UDID> wait-for "Next Screen" 10
+
+  RUNNING MULTIPLE SIMULATORS IN PARALLEL:
+
+  # Each simulator needs its own WDA port and its own --device flag:
+  sim.sh --device <UDID1> setup com.example.myapp --port 8100
+  sim.sh --device <UDID2> setup com.example.myapp --port 8101
+  # Tap commands to each simulator are fully independent (no global serialisation needed)
+
+EOF
+}
+
+# ── Input Validation ──────────────────────────────────────────────────────────
+
+_is_integer() { [[ "$1" =~ ^-?[0-9]+$ ]]; }
+
+# ── Device Detection ──────────────────────────────────────────────────────────
+
+detect_device() {
+  local json
+  json=$(xcrun simctl list devices --json 2>/dev/null) \
+    || die "xcrun simctl failed. Ensure Xcode command-line tools are installed."
+
+  # Find the target device: either by UDID (if --device was given) or the most recently booted.
+  local chosen_json
+  if [[ -n "$SIM_TARGET_UDID" ]]; then
+    chosen_json=$(echo "$json" | jq --arg udid "$SIM_TARGET_UDID" '
+      [
+        .devices
+        | to_entries[]
+        | .key as $runtime
+        | .value[]
+        | select(.udid == $udid)
+        | . + { runtime: $runtime }
+      ]
+      | first // empty
+    ' 2>/dev/null) || die "jq failed parsing simctl output."
+    [[ -n "$chosen_json" ]] && [[ "$chosen_json" != "null" ]] \
+      || die "No simulator found with UDID: $SIM_TARGET_UDID"
+  else
+    chosen_json=$(echo "$json" | jq '
+      [
+        .devices
+        | to_entries[]
+        | .key as $runtime
+        | .value[]
+        | select(.state == "Booted")
+        | . + { runtime: $runtime }
+      ]
+      | if length == 0 then empty
+        else (sort_by(.lastBootedAt // "") | last)
+        end
+    ' 2>/dev/null) || die "jq failed parsing simctl output. Ensure jq is installed (brew install jq)."
+    [[ -z "$chosen_json" ]] && die "No booted simulator found. Boot a simulator in Xcode first."
+  fi
+
+  IFS=$'\t' read -r SIM_UDID SIM_NAME SIM_DEVICE_TYPE < <(
+    echo "$chosen_json" | jq -r '[.udid, .name, .deviceTypeIdentifier] | @tsv'
+  )
+
+  # Convert runtime key to readable OS string: e.g.
+  # "com.apple.CoreSimulator.SimRuntime.iOS-18-2" → "iOS 18.2"
+  local raw_runtime
+  raw_runtime=$(echo "$chosen_json" | jq -r '.runtime')
+  SIM_OS=$(echo "$raw_runtime" \
+    | sed 's/com\.apple\.CoreSimulator\.SimRuntime\.//' \
+    | sed 's/-/ /g' \
+    | awk '{
+        os = $1
+        ver = ""
+        for (i=2; i<=NF; i++) {
+          if (i==2) ver = $i
+          else ver = ver "." $i
+        }
+        print os " " ver
+      }')
+}
+
+# ── Logical Resolution Lookup ─────────────────────────────────────────────────
+
+lookup_logical_resolution() {
+  local profiles_dir="/Library/Developer/CoreSimulator/Profiles/DeviceTypes"
+  [[ -d "$profiles_dir" ]] \
+    || die "CoreSimulator device profiles not found at: $profiles_dir"
+
+  local bundle_path=""
+  local candidate
+  for candidate in "$profiles_dir"/*.simdevicetype; do
+    [[ -d "$candidate" ]] || continue
+    local plist="$candidate/Contents/Info.plist"
+    [[ -f "$plist" ]] || continue
+    local identifier
+    identifier=$(plutil -extract CFBundleIdentifier raw "$plist" 2>/dev/null) || continue
+    if [[ "$identifier" == "$SIM_DEVICE_TYPE" ]]; then
+      bundle_path="$candidate"
+      break
+    fi
+  done
+
+  [[ -n "$bundle_path" ]] \
+    || die "Could not find device type profile for: $SIM_DEVICE_TYPE"
+
+  local profile_plist="$bundle_path/Contents/Resources/profile.plist"
+  [[ -f "$profile_plist" ]] \
+    || die "profile.plist not found in: $bundle_path/Contents/Resources/"
+
+  local px_w px_h scale
+  px_w=$(plutil -extract mainScreenWidth  raw "$profile_plist" 2>/dev/null | tr -d '[:space:]') \
+    || die "Could not read mainScreenWidth from profile.plist"
+  px_h=$(plutil -extract mainScreenHeight raw "$profile_plist" 2>/dev/null | tr -d '[:space:]') \
+    || die "Could not read mainScreenHeight from profile.plist"
+  scale=$(plutil -extract mainScreenScale raw "$profile_plist" 2>/dev/null | tr -d '[:space:]') \
+    || die "Could not read mainScreenScale from profile.plist"
+
+  [[ "$px_w" =~ ^[0-9]+$ ]] || die "mainScreenWidth is not a positive integer: '$px_w'"
+  [[ "$px_h" =~ ^[0-9]+$ ]] || die "mainScreenHeight is not a positive integer: '$px_h'"
+
+  SIM_SCALE="$scale"
+  SIM_LOGICAL_W=$(awk "BEGIN { printf \"%d\", $px_w / $scale }")
+  SIM_LOGICAL_H=$(awk "BEGIN { printf \"%d\", $px_h / $scale }")
+  [[ "$SIM_LOGICAL_W" -gt 0 && "$SIM_LOGICAL_H" -gt 0 ]] \
+    || die "Invalid logical resolution computed: ${SIM_LOGICAL_W}x${SIM_LOGICAL_H}"
+}
+
+# ── Screen Bounds Detection ───────────────────────────────────────────────────
+
+detect_screen_bounds() {
+  pgrep -x Simulator > /dev/null 2>&1 \
+    || die "Simulator.app is not running. Launch the Simulator from Xcode first."
+
+  local applescript_result
+  applescript_result=$(osascript << APPLESCRIPT 2>/dev/null
+tell application "System Events"
+  tell process "Simulator"
+    -- Find the target window by matching the full title "Name – OS" (e.g. "iPhone 16 – iOS 18.1")
+    -- This distinguishes two simulators of the same model running different OS versions.
+    set targetWindow to missing value
+    set simFullTitle to "${SIM_NAME} – ${SIM_OS}"
+    repeat with w in windows
+      set wName to name of w
+      if wName starts with simFullTitle then
+        set targetWindow to w
+        exit repeat
+      end if
+    end repeat
+    if targetWindow is missing value then set targetWindow to window 1
+
+    -- Find screen element: ratio-match direct children, then try to go one level deeper
+    -- to get inside the bezel frame to the actual screen surface
+    set targetRatio to ${SIM_LOGICAL_W} / ${SIM_LOGICAL_H}
+    set bestEl to missing value
+    set bestScore to 999
+
+    repeat with el in UI elements of targetWindow
+      try
+        set elSz to size of el
+        set elW to item 1 of elSz
+        set elH to item 2 of elSz
+        if elW > 100 and elH > 100 then
+          set ratio to elW / elH
+          set diff to ratio - targetRatio
+          if diff < 0 then set diff to -diff
+          if diff < bestScore then
+            set bestScore to diff
+            set bestEl to el
+          end if
+        end if
+      end try
+    end repeat
+
+    if bestEl is missing value then
+      return "ERROR: Could not find screen element in Simulator accessibility tree"
+    end if
+    if bestScore > 0.05 then
+      return "ERROR: Best matching element ratio diff " & bestScore & " exceeds threshold"
+    end if
+
+    -- Try to descend one level: find a child whose aspect ratio is also within 5%
+    -- This moves us from the bezel frame into the actual screen surface
+    try
+      repeat with child in UI elements of bestEl
+        try
+          set cSz to size of child
+          set cW to item 1 of cSz
+          set cH to item 2 of cSz
+          if cW > 50 and cH > 50 then
+            set cRatio to cW / cH
+            set cDiff to cRatio - targetRatio
+            if cDiff < 0 then set cDiff to -cDiff
+            if cDiff < 0.05 then
+              set bestEl to child
+              exit repeat
+            end if
+          end if
+        end try
+      end repeat
+    end try
+
+    set screenPos to position of bestEl
+    set screenSz to size of bestEl
+    set px to (item 1 of screenPos) as integer
+    set py to (item 2 of screenPos) as integer
+    set pw to (item 1 of screenSz) as integer
+    set ph to (item 2 of screenSz) as integer
+    return (px as text) & "," & (py as text) & "," & (pw as text) & "," & (ph as text)
+  end tell
+end tell
+APPLESCRIPT
+  )
+
+  if [[ -z "$applescript_result" ]] || [[ "$applescript_result" == ERROR:* ]]; then
+    die "AppleScript failed to detect screen bounds. Ensure Terminal has Accessibility permission in System Settings > Privacy & Security > Accessibility. Detail: ${applescript_result:-empty response}"
+  fi
+
+  SIM_SCREEN_X=$(echo "$applescript_result" | cut -d',' -f1 | tr -d ' ')
+  SIM_SCREEN_Y=$(echo "$applescript_result" | cut -d',' -f2 | tr -d ' ')
+  SIM_SCREEN_W=$(echo "$applescript_result" | cut -d',' -f3 | tr -d ' ')
+  SIM_SCREEN_H=$(echo "$applescript_result" | cut -d',' -f4 | tr -d ' ')
+
+  SIM_ZOOM=$(awk "BEGIN { printf \"%.4f\", $SIM_SCREEN_W / $SIM_LOGICAL_W }")
+
+  # Sanity check: screen dimensions must be non-zero and zoom must be plausible
+  [[ "$SIM_SCREEN_W" -gt 0 && "$SIM_SCREEN_H" -gt 0 ]] \
+    || die "AppleScript returned invalid screen size: ${SIM_SCREEN_W}x${SIM_SCREEN_H}. The Simulator window accessibility tree may have changed — try restarting Simulator."
+  local zoom_ok
+  zoom_ok=$(awk "BEGIN { z=${SIM_ZOOM}; print (z >= 0.4 && z <= 6.0) ? \"ok\" : \"bad\" }")
+  [[ "$zoom_ok" == "ok" ]] \
+    || die "Computed zoom factor ${SIM_ZOOM} is outside plausible range (0.4–6.0). Screen bounds detection likely failed."
+}
+
+# ── Coordinate Mapping ────────────────────────────────────────────────────────
+
+to_screen_x() { awk "BEGIN { printf \"%d\", ${SIM_SCREEN_X} + int(${1} * ${SIM_ZOOM} + 0.5) }"; }
+to_screen_y() { awk "BEGIN { printf \"%d\", ${SIM_SCREEN_Y} + int(${1} * ${SIM_ZOOM} + 0.5) }"; }
+
+# ── WDA Touch Backend ─────────────────────────────────────────────────────────
+#
+# All touch injection goes through WebDriverAgent (WDA), which runs as an
+# XCUITest runner inside each simulator. The flow is:
+#   curl W3C Actions JSON → WDA HTTP server → XCTest framework →
+#   testmanagerd socket (UDID-scoped) → synthetic IOHIDEvent
+#
+# Because the channel is scoped to a specific simulator UDID via testmanagerd,
+# there is no window-focus dependency and no need for a global serialization
+# queue. Multiple simulators can receive taps concurrently.
+#
+# Coordinate space: WDA accepts iOS UIKit logical points (not pixels, not macOS
+# screen coordinates). The functions below receive macOS screen coordinates
+# (from the internal to_screen_x/to_screen_y mapping) and reverse-map them
+# back to logical points before sending to WDA.
+
+# _tap_cgevent <screen_x> <screen_y>
+# Despite the historical name, this uses WDA W3C pointer actions (not CGEvent).
+# Accepts macOS screen coordinates and reverse-maps to iOS logical UIKit points.
+# Sends a W3C Actions sequence: pointerMove → pointerDown → pause(100ms) → pointerUp.
+# The request is UDID-scoped via the cached WDA session on WDA_PORT.
+_tap_cgevent() {
+  local sx="$1" sy="$2"
+  _wda_ensure
+  # Reverse map macOS screen coords → iOS logical points: logical = (screen - origin) / zoom
+  local lx ly
+  lx=$(awk "BEGIN { printf \"%d\", ($sx - $SIM_SCREEN_X) / $SIM_ZOOM + 0.5 }")
+  ly=$(awk "BEGIN { printf \"%d\", ($sy - $SIM_SCREEN_Y) / $SIM_ZOOM + 0.5 }")
+
+  local body
+  body=$(python3 -c "import json; print(json.dumps({'actions':[{'type':'pointer','id':'f1','parameters':{'pointerType':'touch'},'actions':[{'type':'pointerMove','duration':0,'x':${lx},'y':${ly}},{'type':'pointerDown','button':0},{'type':'pause','duration':100},{'type':'pointerUp','button':0}]}]}))")
+
+  local resp http_code
+  resp=$(curl -s -w "\n%{http_code}" -X POST \
+    -H "Content-Type: application/json" \
+    -d "$body" \
+    --max-time 10 \
+    "http://localhost:${WDA_PORT}/session/${WDA_SESSION}/actions" 2>/dev/null) || \
+    die "WDA tap: curl failed at logical (${lx},${ly})"
+  http_code=$(echo "$resp" | tail -1)
+  [[ "$http_code" == "200" ]] \
+    || die "WDA tap: HTTP ${http_code} at logical (${lx},${ly}). Response: $(echo "$resp" | head -1)"
+}
+
+# _swipe_cgevent <sx1> <sy1> <sx2> <sy2> [steps=25] [step_ms=20]
+# Despite the historical name, this uses WDA W3C pointer actions (not CGEvent).
+# Accepts macOS screen coordinates; reverse-maps to iOS logical UIKit points.
+# Sends a W3C Actions sequence: pointerMove(start) → pointerDown → pointerMove(end,
+# duration=steps*step_ms ms) → pointerUp. The duration parameter is how WDA
+# interpolates the finger movement — longer duration = slower, smoother swipe.
+# Default: 25 steps × 20ms = 500ms total swipe duration.
+# All coordinates are UDID-scoped via testmanagerd — no global queue needed.
+_swipe_cgevent() {
+  local sx1="$1" sy1="$2" sx2="$3" sy2="$4"
+  local steps="${5:-25}"
+  local step_ms="${6:-20}"
+  _wda_ensure
+  # Reverse map macOS screen coords → iOS logical points for both endpoints
+  local lx1 ly1 lx2 ly2
+  lx1=$(awk "BEGIN { printf \"%d\", ($sx1 - $SIM_SCREEN_X) / $SIM_ZOOM + 0.5 }")
+  ly1=$(awk "BEGIN { printf \"%d\", ($sy1 - $SIM_SCREEN_Y) / $SIM_ZOOM + 0.5 }")
+  lx2=$(awk "BEGIN { printf \"%d\", ($sx2 - $SIM_SCREEN_X) / $SIM_ZOOM + 0.5 }")
+  ly2=$(awk "BEGIN { printf \"%d\", ($sy2 - $SIM_SCREEN_Y) / $SIM_ZOOM + 0.5 }")
+  # Total swipe duration = steps * step_ms (default 25*20 = 500ms)
+  local duration_ms
+  duration_ms=$(( steps * step_ms ))
+
+  local body
+  body=$(python3 -c "import json; print(json.dumps({'actions':[{'type':'pointer','id':'f1','parameters':{'pointerType':'touch'},'actions':[{'type':'pointerMove','duration':0,'x':${lx1},'y':${ly1}},{'type':'pointerDown','button':0},{'type':'pointerMove','duration':${duration_ms},'x':${lx2},'y':${ly2}},{'type':'pointerUp','button':0}]}]}))")
+
+  local resp http_code
+  resp=$(curl -s -w "\n%{http_code}" -X POST \
+    -H "Content-Type: application/json" \
+    -d "$body" \
+    --max-time 15 \
+    "http://localhost:${WDA_PORT}/session/${WDA_SESSION}/actions" 2>/dev/null) || \
+    die "WDA swipe: curl failed from logical (${lx1},${ly1}) to (${lx2},${ly2})"
+  http_code=$(echo "$resp" | tail -1)
+  [[ "$http_code" == "200" ]] \
+    || die "WDA swipe: HTTP ${http_code}. Response: $(echo "$resp" | head -1)"
+}
+
+# _wda_type <text>
+# Sets text in the currently focused/active element via WDA's setValue endpoint.
+# This goes through the proper iOS input path (unlike the AX direct-value approach).
+# Requires WDA to be running (_wda_ensure must succeed).
+# Returns 0 on success, 1 on failure (caller falls back to _type_cgevent).
+_wda_type() {
+  local text="$1"
+  # Load WDA session — if not running, return 1 so caller can fall back
+  if [[ -z "$WDA_PORT" || -z "$WDA_SESSION" ]]; then
+    return 1
+  fi
+  # Quick liveness check
+  local http_code
+  http_code=$(curl -s -o /dev/null -w "%{http_code}" \
+    --max-time 3 \
+    "http://localhost:${WDA_PORT}/session/${WDA_SESSION}" 2>/dev/null) || true
+  if [[ "$http_code" != "200" ]]; then
+    return 1
+  fi
+
+  # Find the active/focused element
+  local active_resp
+  active_resp=$(curl -s --max-time 5 \
+    "http://localhost:${WDA_PORT}/session/${WDA_SESSION}/element/active" \
+    2>/dev/null) || return 1
+
+  local element_id
+  element_id=$(echo "$active_resp" | python3 -c \
+    "import sys,json; d=json.load(sys.stdin); v=d.get('value',{}); print(v.get('ELEMENT') or v.get('element-6066-11e4-a52e-4f735466cecf',''))" \
+    2>/dev/null) || return 1
+  [[ -n "$element_id" ]] || return 1
+
+  # Set value on the active element — goes through proper iOS input path
+  local body set_resp set_code
+  body=$(python3 -c "import json,sys; print(json.dumps({'value': [sys.argv[1]], 'text': sys.argv[1]}))" "$text" 2>/dev/null) || return 1
+  set_resp=$(curl -s -w "\n%{http_code}" -X POST \
+    -H "Content-Type: application/json" \
+    -d "$body" \
+    --max-time 10 \
+    "http://localhost:${WDA_PORT}/session/${WDA_SESSION}/element/${element_id}/value" \
+    2>/dev/null) || return 1
+  set_code=$(echo "$set_resp" | tail -1)
+  [[ "$set_code" == "200" ]] || return 1
+  return 0
+}
+
+# _type_cgevent <text>
+# Sets text in the currently focused field via the AX API (no keyboard events needed)
+_type_cgevent() {
+  local text="$1"
+  # Pass the text via environment variable so the quoted heredoc can stay static
+  local out
+  out=$(SIM_TYPE_TEXT="$text" swift - "${SIM_NAME} – ${SIM_OS}" "$SIM_SCREEN_X" "$SIM_SCREEN_Y" 2>&1 << 'SWIFTEOF'
+import Cocoa
+import ApplicationServices
+
+let args = CommandLine.arguments
+let deviceName = args.count > 1 ? args[1] : ""
+let screenX    = Double(args.count > 2 ? args[2] : "0") ?? 0.0
+let screenY    = Double(args.count > 3 ? args[3] : "0") ?? 0.0
+
+guard let app = NSRunningApplication.runningApplications(
+    withBundleIdentifier: "com.apple.iphonesimulator").first else {
+  fputs("ERROR: Simulator not running\n", stderr); exit(1)
+}
+
+let axApp = AXUIElementCreateApplication(app.processIdentifier)
+
+func getAttribute(_ el: AXUIElement, _ attr: String) -> CFTypeRef? {
+    var v: CFTypeRef?
+    AXUIElementCopyAttributeValue(el, attr as CFString, &v)
+    return v
+}
+
+let textRoles: Set<String> = ["AXTextField", "AXTextArea", "AXSearchField"]
+
+func isSettableTextField(_ el: AXUIElement) -> Bool {
+    guard let role = getAttribute(el, "AXRole") as? String,
+          textRoles.contains(role) else { return false }
+    var settable: DarwinBoolean = false
+    AXUIElementIsAttributeSettable(el, "AXValue" as CFString, &settable)
+    return settable.boolValue
+}
+
+func findFocusedTextField(_ el: AXUIElement, _ depth: Int) -> AXUIElement? {
+    if depth < 0 { return nil }
+    if let focused = getAttribute(el, "AXFocused") as? Bool, focused,
+       isSettableTextField(el) {
+        return el
+    }
+    guard let children = getAttribute(el, "AXChildren") as? [AXUIElement] else { return nil }
+    for child in children {
+        if let found = findFocusedTextField(child, depth - 1) { return found }
+    }
+    return nil
+}
+
+func findFirstSettableTextField(_ el: AXUIElement, _ depth: Int) -> AXUIElement? {
+    if depth < 0 { return nil }
+    if isSettableTextField(el) { return el }
+    guard let children = getAttribute(el, "AXChildren") as? [AXUIElement] else { return nil }
+    for child in children {
+        if let found = findFirstSettableTextField(child, depth - 1) { return found }
+    }
+    return nil
+}
+
+func pickWindow(_ windows: [AXUIElement], screenX: Double, screenY: Double, deviceName: String) -> AXUIElement? {
+    // Primary: find the window whose bounds contain the known screen origin.
+    // SIM_SCREEN_X/Y are the macOS screen coords of the iOS screen surface — unique per window.
+    for win in windows {
+        var posRef: CFTypeRef?
+        var sizeRef: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(win, kAXPositionAttribute as CFString, &posRef) == .success,
+              AXUIElementCopyAttributeValue(win, kAXSizeAttribute as CFString, &sizeRef) == .success,
+              let pv = posRef, let sv = sizeRef else { continue }
+        var pt = CGPoint.zero; var sz = CGSize.zero
+        AXValueGetValue(pv as! AXValue, .cgPoint, &pt)
+        AXValueGetValue(sv as! AXValue, .cgSize, &sz)
+        if screenX >= Double(pt.x) && screenX <= Double(pt.x + sz.width) &&
+           screenY >= Double(pt.y) && screenY <= Double(pt.y + sz.height) {
+            return win
+        }
+    }
+    // Fallback: match by title containing device name
+    for win in windows {
+        var titleRef: CFTypeRef?
+        if AXUIElementCopyAttributeValue(win, kAXTitleAttribute as CFString, &titleRef) == .success,
+           let title = titleRef as? String, title.contains(deviceName) { return win }
+    }
+    return windows.first
+}
+
+guard let windows = getAttribute(axApp, "AXWindows") as? [AXUIElement],
+      let window = pickWindow(windows, screenX: screenX, screenY: screenY, deviceName: deviceName) else {
+    fputs("ERROR: no Simulator window\n", stderr); exit(1)
+}
+
+// 1. Try the shortcut focused element if it is itself a settable text field
+var focusedEl: AXUIElement? = nil
+if let f = getAttribute(axApp, "AXFocusedUIElement") {
+    let candidate = f as! AXUIElement
+    if isSettableTextField(candidate) {
+        focusedEl = candidate
+    }
+}
+
+// 2. Walk tree for a focused+settable text field
+if focusedEl == nil {
+    focusedEl = findFocusedTextField(window, 25)
+}
+
+// 3. Fall back: first settable text field anywhere in the tree
+if focusedEl == nil {
+    focusedEl = findFirstSettableTextField(window, 25)
+}
+
+guard let target = focusedEl else {
+    fputs("ERROR: no focused element found — tap the text field first\n", stderr); exit(1)
+}
+
+// Read text from the environment variable
+let text = ProcessInfo.processInfo.environment["SIM_TYPE_TEXT"] ?? ""
+
+// Set the value directly
+let result = AXUIElementSetAttributeValue(target, "AXValue" as CFString, text as CFTypeRef)
+if result != .success {
+    fputs("ERROR: AXUIElementSetAttributeValue failed (code \(result.rawValue)) — field may not support direct value setting\n", stderr)
+    exit(1)
+}
+
+print("OK")
+SWIFTEOF
+  ) || die "type: failed — $out"
+
+  if [[ "$out" == ERROR:* ]]; then
+    die "type: $out"
+  fi
+}
+
+# ── Bootstrap ─────────────────────────────────────────────────────────────────
+
+_write_bootstrap_cache() {
+  local cache_file="/tmp/sim_bootstrap_cache_${SIM_TARGET_UDID:-default}.json"
+  local win_pos
+  win_pos=$(osascript << APPLESCRIPT 2>/dev/null
+tell application "System Events"
+  tell process "Simulator"
+    set targetWindow to missing value
+    set simFullTitle to "${SIM_NAME} – ${SIM_OS}"
+    repeat with w in windows
+      set wName to name of w
+      if wName starts with simFullTitle then
+        set targetWindow to w
+        exit repeat
+      end if
+    end repeat
+    if targetWindow is missing value then set targetWindow to window 1
+    get position of targetWindow
+  end tell
+end tell
+APPLESCRIPT
+  )
+  local wx wy
+  wx=$(echo "$win_pos" | awk -F',' '{print $1}' | tr -d ' ')
+  wy=$(echo "$win_pos" | awk -F',' '{print $2}' | tr -d ' ')
+  # Read existing wda_port/wda_session from cache if present (preserve across re-bootstraps)
+  local existing_wda_port existing_wda_session
+  existing_wda_port=$(jq -r '.wda_port // ""' "$cache_file" 2>/dev/null || true)
+  existing_wda_session=$(jq -r '.wda_session // ""' "$cache_file" 2>/dev/null || true)
+  local wda_port_val="${WDA_PORT:-${existing_wda_port:-}}"
+  local wda_session_val="${WDA_SESSION:-${existing_wda_session:-}}"
+  cat > "$cache_file" << CACHEEOF
+{
+  "udid": "$SIM_UDID",
+  "name": "$SIM_NAME",
+  "device_type": "$SIM_DEVICE_TYPE",
+  "os": "$SIM_OS",
+  "logical_w": $SIM_LOGICAL_W,
+  "logical_h": $SIM_LOGICAL_H,
+  "scale": "$SIM_SCALE",
+  "screen_x": $SIM_SCREEN_X,
+  "screen_y": $SIM_SCREEN_Y,
+  "screen_w": $SIM_SCREEN_W,
+  "screen_h": $SIM_SCREEN_H,
+  "zoom": "$SIM_ZOOM",
+  "window_x": $wx,
+  "window_y": $wy,
+  "wda_port": "$wda_port_val",
+  "wda_session": "$wda_session_val"
+}
+CACHEEOF
+}
+
+_load_bootstrap_cache() {
+  local cache_file="/tmp/sim_bootstrap_cache_${SIM_TARGET_UDID:-default}.json"
+  [[ -f "$cache_file" ]] || return 1
+  # Validate UDID still booted
+  local cached_udid
+  cached_udid=$(jq -r '.udid' "$cache_file" 2>/dev/null)
+  [[ -n "$cached_udid" ]] || return 1
+  # If a specific device was requested, ensure the cache is for that device
+  if [[ -n "$SIM_TARGET_UDID" && "$cached_udid" != "$SIM_TARGET_UDID" ]]; then
+    return 1
+  fi
+  local state
+  state=$(plutil -extract state raw "$HOME/Library/Developer/CoreSimulator/Devices/$cached_udid/device.plist" 2>/dev/null)
+  [[ "$state" == "3" ]] || return 1
+  # Validate window hasn't moved
+  local cached_wx cached_wy
+  cached_wx=$(jq -r '.window_x' "$cache_file")
+  cached_wy=$(jq -r '.window_y' "$cache_file")
+  local cached_name cached_os
+  cached_name=$(jq -r '.name' "$cache_file")
+  cached_os=$(jq -r '.os' "$cache_file")
+  local current_pos
+  current_pos=$(osascript << APPLESCRIPT 2>/dev/null
+tell application "System Events"
+  tell process "Simulator"
+    set targetWindow to missing value
+    set simFullTitle to "${cached_name} – ${cached_os}"
+    repeat with w in windows
+      set wName to name of w
+      if wName starts with simFullTitle then
+        set targetWindow to w
+        exit repeat
+      end if
+    end repeat
+    if targetWindow is missing value then set targetWindow to window 1
+    get position of targetWindow
+  end tell
+end tell
+APPLESCRIPT
+  )
+  local cur_wx cur_wy
+  cur_wx=$(echo "$current_pos" | awk -F',' '{print $1}' | tr -d ' ')
+  cur_wy=$(echo "$current_pos" | awk -F',' '{print $2}' | tr -d ' ')
+  [[ "$cur_wx" == "$cached_wx" && "$cur_wy" == "$cached_wy" ]] || return 1
+  # Load all globals from cache
+  SIM_UDID=$(jq -r '.udid' "$cache_file")
+  SIM_NAME=$(jq -r '.name' "$cache_file")
+  SIM_DEVICE_TYPE=$(jq -r '.device_type' "$cache_file")
+  SIM_OS=$(jq -r '.os' "$cache_file")
+  SIM_LOGICAL_W=$(jq -r '.logical_w' "$cache_file")
+  SIM_LOGICAL_H=$(jq -r '.logical_h' "$cache_file")
+  SIM_SCALE=$(jq -r '.scale' "$cache_file")
+  SIM_SCREEN_X=$(jq -r '.screen_x' "$cache_file")
+  SIM_SCREEN_Y=$(jq -r '.screen_y' "$cache_file")
+  SIM_SCREEN_W=$(jq -r '.screen_w' "$cache_file")
+  SIM_SCREEN_H=$(jq -r '.screen_h' "$cache_file")
+  SIM_ZOOM=$(jq -r '.zoom' "$cache_file")
+  WDA_PORT=$(jq -r '.wda_port // ""' "$cache_file")
+  WDA_SESSION=$(jq -r '.wda_session // ""' "$cache_file")
+  return 0
+}
+
+_bootstrap() {
+  [[ -n "$SIM_UDID" ]] && return 0  # already bootstrapped this invocation
+  if _load_bootstrap_cache; then
+    return 0  # cache hit — skip all detection
+  fi
+  # Cache miss — run full detection and write cache
+  detect_device
+  lookup_logical_resolution
+  detect_screen_bounds
+  _write_bootstrap_cache
+}
+
+# Write only wda_port and wda_session into the existing cache file (patch in-place via jq).
+_wda_write_cache() {
+  local cache_file="/tmp/sim_bootstrap_cache_${SIM_TARGET_UDID:-default}.json"
+  [[ -f "$cache_file" ]] || die "_wda_write_cache: bootstrap cache missing — run bootstrap first"
+  local tmp
+  tmp=$(mktemp /tmp/sim_wda_cache_XXXXXX.json)
+  jq --arg port "$WDA_PORT" --arg session "$WDA_SESSION" \
+    '.wda_port = $port | .wda_session = $session' "$cache_file" > "$tmp" \
+    && mv "$tmp" "$cache_file" \
+    || { rm -f "$tmp"; die "_wda_write_cache: failed to update cache"; }
+}
+
+# _wda_ensure — called at the start of every tap and swipe to validate that
+# WDA is running and the cached session is still alive. It checks two things:
+#   1. WDA_PORT and WDA_SESSION are non-empty (loaded from cache or wda-start).
+#   2. The session is live: GET /session/:id returns HTTP 200.
+# If either check fails, it dies with an actionable error telling the agent to
+# run `sim.sh --device <UDID> wda-start <port>` to restart WDA.
+# This guard ensures every tap/swipe is UDID-scoped and routed correctly —
+# there is no fallback to CGEvent or any other global input injection.
+_wda_ensure() {
+  if [[ -z "$WDA_PORT" || -z "$WDA_SESSION" ]]; then
+    local udid_hint="${SIM_TARGET_UDID:-<UDID>}"
+    die "WDA not running. Start with: sim.sh --device ${udid_hint} wda-start <port>"
+  fi
+  # Quick liveness check — GET /session/:id (WDA returns 200 if alive)
+  local http_code
+  http_code=$(curl -s -o /dev/null -w "%{http_code}" \
+    --max-time 3 \
+    "http://localhost:${WDA_PORT}/session/${WDA_SESSION}" 2>/dev/null) || true
+  if [[ "$http_code" != "200" ]]; then
+    # Session dead — clear cached values so the error message is clean
+    WDA_PORT=""
+    WDA_SESSION=""
+    local udid_hint="${SIM_TARGET_UDID:-<UDID>}"
+    die "WDA session is no longer alive (HTTP ${http_code:-timeout}). Restart with: sim.sh --device ${udid_hint} wda-start <port>"
+  fi
+}
+
+# ── WDA Commands ─────────────────────────────────────────────────────────────
+
+# cmd_wda_start [port]
+#
+# WebDriverAgent (WDA) is an Apple XCUITest-based HTTP server that runs inside
+# the iOS Simulator. It exposes a W3C WebDriver-compatible REST API for touch
+# injection, app control, and other automation primitives. All tap and swipe
+# commands in this tool use WDA as their touch backend.
+#
+# This command uses `xcodebuild test-without-building` against a pre-built WDA
+# binary located at /tmp/WDA_DerivedData. The DerivedData directory must already
+# exist (built once via `xcodebuild build` against the WebDriverAgent project).
+# This avoids re-compiling WDA on every invocation.
+#
+# Port-to-UDID mapping: each running simulator needs its own port number so
+# that multiple simulators can have WDA running simultaneously without conflict.
+# Example: simulator A → port 8100, simulator B → port 8101.
+# Always pass --device <UDID> together with wda-start so the correct simulator
+# is targeted and the port/session are cached under that UDID's cache file.
+#
+# After WDA starts and its HTTP server is ready, this command POSTs to /session
+# to create a W3C session. The resulting session ID and port are cached in
+# /tmp/sim_bootstrap_cache_<UDID>.json so subsequent tap/swipe calls can reuse
+# them without re-running wda-start.
+cmd_wda_start() {
+  local port="${1:-8100}"
+  _bootstrap
+
+  local wda_derived="/tmp/WDA_DerivedData"
+  # WDA must be pre-built — this path is created by building WebDriverAgent once.
+  [[ -d "$wda_derived" ]] || die "WDA DerivedData not found at $wda_derived — build WDA first"
+
+  # Find the WDA test runner app bundle inside the pre-built DerivedData
+  local wda_bundle
+  wda_bundle=$(find "$wda_derived" -name "WebDriverAgentRunner-Runner.app" 2>/dev/null | head -1)
+  [[ -n "$wda_bundle" ]] || die "WebDriverAgentRunner-Runner.app not found in $wda_derived"
+
+  echo "Starting WDA for UDID=${SIM_UDID} on port ${port}..."
+
+  # Launch WDA in the background using xcodebuild test-without-building.
+  # USE_PORT is picked up by the WDA XCTest runner to bind its HTTP server.
+  local wda_log="/tmp/wda_${SIM_UDID}.log"
+  env USE_PORT="$port" xcodebuild test-without-building \
+    -xctestrun "$(find "$wda_derived" -name "*.xctestrun" | head -1)" \
+    -destination "id=${SIM_UDID}" \
+    > "$wda_log" 2>&1 &
+  local wda_pid=$!
+  echo "WDA process PID: $wda_pid (log: $wda_log)"
+
+  # Wait up to 60s for WDA /status to become ready
+  echo -n "Waiting for WDA HTTP server on port ${port}..."
+  local attempts=0
+  local max_attempts=60
+  while [[ $attempts -lt $max_attempts ]]; do
+    local status_code
+    status_code=$(curl -s -o /dev/null -w "%{http_code}" \
+      --max-time 2 "http://localhost:${port}/status" 2>/dev/null) || true
+    if [[ "$status_code" == "200" ]]; then
+      echo " ready."
+      break
+    fi
+    echo -n "."
+    sleep 1
+    (( attempts++ )) || true
+  done
+
+  if [[ $attempts -ge $max_attempts ]]; then
+    die "WDA did not become ready on port ${port} within ${max_attempts}s. Check log: $wda_log"
+  fi
+
+  # Create a W3C WebDriver session. WDA requires an active session before
+  # accepting any /actions (tap/swipe) requests. The session ID is returned
+  # in the response body and cached in the bootstrap cache for reuse.
+  echo "Creating WDA session..."
+  local session_resp
+  session_resp=$(curl -s -X POST \
+    -H "Content-Type: application/json" \
+    -d '{"capabilities":{"firstMatch":[{}]}}' \
+    --max-time 15 \
+    "http://localhost:${port}/session" 2>/dev/null) \
+    || die "Failed to POST /session to WDA on port ${port}"
+
+  local session_id
+  session_id=$(echo "$session_resp" | python3 -c \
+    "import sys,json; d=json.load(sys.stdin); print(d.get('sessionId') or d.get('value',{}).get('sessionId',''))" \
+    2>/dev/null) || true
+
+  [[ -n "$session_id" ]] \
+    || die "WDA session creation failed. Response: $session_resp"
+
+  WDA_PORT="$port"
+  WDA_SESSION="$session_id"
+
+  # Persist port and session ID to the bootstrap cache so tap/swipe commands
+  # in subsequent invocations can reuse the running WDA without re-starting it.
+  _wda_write_cache
+
+  echo "WDA ready: port=${WDA_PORT} session=${WDA_SESSION}"
+}
+
+# ── Commands ──────────────────────────────────────────────────────────────────
+
+cmd_status() {
+  detect_device
+  lookup_logical_resolution
+
+  echo "Booted Device:"
+  echo "  UDID:        $SIM_UDID"
+  echo "  Name:        $SIM_NAME"
+  echo "  OS:          $SIM_OS"
+  echo "  Device Type: $SIM_DEVICE_TYPE"
+  echo "  Scale:       ${SIM_SCALE}x"
+  echo "  Logical:     ${SIM_LOGICAL_W}x${SIM_LOGICAL_H} pts"
+
+  local bounds_ok=false
+  if pgrep -x Simulator > /dev/null 2>&1; then
+    if detect_screen_bounds 2>/dev/null; then
+      bounds_ok=true
+    fi
+  fi
+
+  if $bounds_ok; then
+    echo ""
+    echo "Screen Bounds (macOS screen coordinates):"
+    echo "  Origin:      (${SIM_SCREEN_X}, ${SIM_SCREEN_Y})"
+    echo "  Size:        ${SIM_SCREEN_W}x${SIM_SCREEN_H} pts"
+    echo "  Zoom factor: ${SIM_ZOOM}x"
+  else
+    echo ""
+    echo "Screen Bounds: [unavailable — Simulator.app not running or Accessibility permission missing]"
+  fi
+}
+
+cmd_tap() {
+  [[ $# -ge 2 ]] || die "Usage: sim.sh tap <x> <y>"
+  _is_integer "$1" || die "tap: x must be an integer, got: $1"
+  _is_integer "$2" || die "tap: y must be an integer, got: $2"
+  _bootstrap
+  local sx sy
+  sx=$(to_screen_x "$1")
+  sy=$(to_screen_y "$2")
+  _tap_cgevent "$sx" "$sy"
+}
+
+cmd_tap_element() {
+  [[ $# -ge 1 ]] || die "Usage: sim.sh tap-element <label>"
+  local label="$1"
+  _bootstrap
+
+  # Use the fast Swift AX path (same as find-element) to locate the element
+  local json=""
+  if ! json=$(cmd_find_element "$label" 2>/dev/null); then
+    # Fallback: search full describe output for a matching label
+    local desc
+    desc=$(cmd_describe 8 2>/dev/null) || true
+    json=$(echo "$desc" | FIND_LABEL="$label" python3 -c "
+import sys, json as j, os
+label = os.environ['FIND_LABEL'].lower()
+data = j.load(sys.stdin)
+for el in data:
+    if label in el.get('label','').lower():
+        print(j.dumps(el))
+        break
+" 2>/dev/null) || true
+    [[ -n "$json" ]] || die "tap-element: element not found: $label"
+    echo "NOTE: tap-element found '$label' via describe fallback"
+  fi
+
+  # Extract center coordinates from the JSON {x, y, w, h}
+  local lx ly lw lh cx cy
+  lx=$(echo "$json" | jq -r '.x')
+  ly=$(echo "$json" | jq -r '.y')
+  lw=$(echo "$json" | jq -r '.w')
+  lh=$(echo "$json" | jq -r '.h')
+  cx=$(awk "BEGIN { printf \"%d\", $lx + $lw / 2 }")
+  cy=$(awk "BEGIN { printf \"%d\", $ly + $lh / 2 }")
+
+  # Convert to screen coordinates and CGEvent tap
+  local sx sy
+  sx=$(to_screen_x "$cx")
+  sy=$(to_screen_y "$cy")
+  _tap_cgevent "$sx" "$sy"
+
+  echo "OK: tapped $label at ($cx, $cy)"
+
+  # Post-tap check: see if element is gone (navigation likely succeeded)
+  sleep 0.4
+  if ! ( cmd_find_element "$label" > /dev/null 2>&1 ); then
+    echo "NOTE: '$label' no longer visible — navigation likely succeeded"
+  fi
+}
+
+cmd_tap_and_wait() {
+  [[ $# -ge 1 ]] || die "Usage: sim.sh tap-and-wait <label> [expected_label] [timeout]"
+  local label="$1"
+  local expected_label="${2:-}"
+  local timeout="${3:-10}"
+  _bootstrap
+
+  # Step 1: locate element via find-element
+  local json=""
+  if ! json=$(cmd_find_element "$label" 2>/dev/null); then
+    die "tap-and-wait: element not found: $label"
+  fi
+
+  # Step 2: compute center coordinates
+  local lx ly lw lh cx cy
+  lx=$(echo "$json" | jq -r '.x')
+  ly=$(echo "$json" | jq -r '.y')
+  lw=$(echo "$json" | jq -r '.w')
+  lh=$(echo "$json" | jq -r '.h')
+  cx=$(awk "BEGIN { printf \"%d\", $lx + $lw / 2 }")
+  cy=$(awk "BEGIN { printf \"%d\", $ly + $lh / 2 }")
+
+  # Step 3: tap at center using CGEvent
+  local sx sy
+  sx=$(to_screen_x "$cx")
+  sy=$(to_screen_y "$cy")
+  _tap_cgevent "$sx" "$sy" || die "tap-and-wait: tap failed at ($cx, $cy)"
+  echo "OK: tapped '$label' at ($cx, $cy)" >&2
+
+  # Step 4: wait for expected label or settle
+  if [[ -n "$expected_label" ]]; then
+    cmd_wait_for "$expected_label" "$timeout" || \
+      echo "WARNING: timed out waiting for '$expected_label' after ${timeout}s" >&2
+  else
+    sleep 1.5
+  fi
+
+  # Step 5: return layout-map JSON
+  cmd_layout_map
+}
+
+cmd_swipe() {
+  [[ $# -ge 4 ]] || die "Usage: sim.sh swipe <x1> <y1> <x2> <y2> [steps] [step_ms]"
+  _is_integer "$1" || die "swipe: x1 must be an integer, got: $1"
+  _is_integer "$2" || die "swipe: y1 must be an integer, got: $2"
+  _is_integer "$3" || die "swipe: x2 must be an integer, got: $3"
+  _is_integer "$4" || die "swipe: y2 must be an integer, got: $4"
+  _bootstrap
+  local sx1 sy1 sx2 sy2
+  sx1=$(to_screen_x "$1")
+  sy1=$(to_screen_y "$2")
+  sx2=$(to_screen_x "$3")
+  sy2=$(to_screen_y "$4")
+  local steps="${5:-25}"
+  local step_ms="${6:-20}"
+  _swipe_cgevent "$sx1" "$sy1" "$sx2" "$sy2" "$steps" "$step_ms"
+}
+
+cmd_scroll_up() {
+  _bootstrap
+  local x from_y to_y
+  x="${1:-$(awk "BEGIN { printf \"%d\", $SIM_LOGICAL_W / 2 }")}"
+  from_y="${2:-$(awk "BEGIN { printf \"%d\", $SIM_LOGICAL_H * 0.75 }")}"
+  to_y="${3:-$(awk "BEGIN { printf \"%d\", $SIM_LOGICAL_H * 0.27 }")}"
+  local sx1 sy1 sx2 sy2
+  sx1=$(to_screen_x "$x");     sy1=$(to_screen_y "$from_y")
+  sx2=$(to_screen_x "$x");     sy2=$(to_screen_y "$to_y")
+  _swipe_cgevent "$sx1" "$sy1" "$sx2" "$sy2"
+}
+
+cmd_scroll_down() {
+  _bootstrap
+  local x from_y to_y
+  x="${1:-$(awk "BEGIN { printf \"%d\", $SIM_LOGICAL_W / 2 }")}"
+  from_y="${2:-$(awk "BEGIN { printf \"%d\", $SIM_LOGICAL_H * 0.27 }")}"
+  to_y="${3:-$(awk "BEGIN { printf \"%d\", $SIM_LOGICAL_H * 0.75 }")}"
+  local sx1 sy1 sx2 sy2
+  sx1=$(to_screen_x "$x");     sy1=$(to_screen_y "$from_y")
+  sx2=$(to_screen_x "$x");     sy2=$(to_screen_y "$to_y")
+  _swipe_cgevent "$sx1" "$sy1" "$sx2" "$sy2"
+}
+
+cmd_scroll_to_visible() {
+  [[ $# -ge 1 ]] || die "Usage: sim.sh scroll-to-visible <label> [max_swipes]"
+  local label="$1"
+  local max_swipes="${2:-10}"
+  _bootstrap
+
+  local found=""
+  local swipe_count=0
+
+  while [[ $swipe_count -le $max_swipes ]]; do
+    if found=$( cmd_find_element "$label" 2>/dev/null ); then
+      echo "$found"
+      return 0
+    fi
+    if [[ $swipe_count -lt $max_swipes ]]; then
+      cmd_scroll_up
+    fi
+    (( swipe_count++ )) || true
+  done
+
+  die "scroll-to-visible: '$label' not found after $max_swipes scrolls"
+}
+
+cmd_describe() {
+  # max_depth arg kept for API compatibility but ignored — Swift AX traversal
+  # uses its own depth limit (25 levels) which is sufficient for all known screens.
+  local interactive_only=false
+  local max_depth="3"
+  for arg in "$@"; do
+    case "$arg" in
+      --interactive|-i) interactive_only=true ;;
+      [0-9]*)           max_depth="$arg" ;;
+    esac
+  done
+  _bootstrap
+
+  # Use Swift + AXUIElement API for fast, reliable UI element enumeration.
+  # This avoids the AppleScript 'entire contents' approach which is O(n) IPC-slow
+  # and degrades severely on deep trees (>100 elements takes minutes in AppleScript).
+  local scrX="$SIM_SCREEN_X"
+  local scrY="$SIM_SCREEN_Y"
+  local zoom="$SIM_ZOOM"
+
+  swift - "$scrX" "$scrY" "$zoom" "$interactive_only" "${SIM_NAME} – ${SIM_OS}" 2>/dev/null << 'SWIFTEOF'
+import ApplicationServices
+import AppKit
+import Foundation
+
+let args = CommandLine.arguments
+let screenX       = Double(args.count > 1 ? args[1] : "-439") ?? -439.0
+let screenY       = Double(args.count > 2 ? args[2] : "148") ?? 148.0
+let zoom          = Double(args.count > 3 ? args[3] : "1.0") ?? 1.0
+let interactiveOnly = (args.count > 4 && args[4] == "true")
+let deviceName    = args.count > 5 ? args[5] : ""
+let interactiveRoles: Set<String> = [
+    "AXButton", "AXTextField", "AXSecureTextField", "AXLink",
+    "AXSwitch", "AXCheckBox", "AXRadioButton", "AXSlider", "AXMenuItem"
+]
+
+// Find Simulator PID
+guard let simApp = NSWorkspace.shared.runningApplications
+    .first(where: { $0.bundleIdentifier == "com.apple.iphonesimulator" }) else {
+  print("[]"); exit(0)
+}
+let simPID = simApp.processIdentifier
+
+let axApp = AXUIElementCreateApplication(simPID)
+var windowsRef: CFTypeRef?
+AXUIElementCopyAttributeValue(axApp, kAXWindowsAttribute as CFString, &windowsRef)
+guard let windows = windowsRef as? [AXUIElement], !windows.isEmpty else {
+  print("[]"); exit(0)
+}
+
+func pickWindow(_ windows: [AXUIElement], screenX: Double, screenY: Double, deviceName: String) -> AXUIElement? {
+    // Primary: find the window whose bounds contain the known screen origin.
+    // SIM_SCREEN_X/Y are the macOS screen coords of the iOS screen surface — unique per window.
+    for win in windows {
+        var posRef: CFTypeRef?
+        var sizeRef: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(win, kAXPositionAttribute as CFString, &posRef) == .success,
+              AXUIElementCopyAttributeValue(win, kAXSizeAttribute as CFString, &sizeRef) == .success,
+              let pv = posRef, let sv = sizeRef else { continue }
+        var pt = CGPoint.zero; var sz = CGSize.zero
+        AXValueGetValue(pv as! AXValue, .cgPoint, &pt)
+        AXValueGetValue(sv as! AXValue, .cgSize, &sz)
+        if screenX >= Double(pt.x) && screenX <= Double(pt.x + sz.width) &&
+           screenY >= Double(pt.y) && screenY <= Double(pt.y + sz.height) {
+            return win
+        }
+    }
+    // Fallback: match by title containing device name
+    for win in windows {
+        var titleRef: CFTypeRef?
+        if AXUIElementCopyAttributeValue(win, kAXTitleAttribute as CFString, &titleRef) == .success,
+           let title = titleRef as? String, title.contains(deviceName) { return win }
+    }
+    return windows.first
+}
+
+guard let win = pickWindow(windows, screenX: screenX, screenY: screenY, deviceName: deviceName) else {
+  print("[]"); exit(0)
+}
+
+func getAttr(_ el: AXUIElement, _ attr: String) -> AnyObject? {
+    var val: CFTypeRef?
+    guard AXUIElementCopyAttributeValue(el, attr as CFString, &val) == .success else { return nil }
+    return val as AnyObject
+}
+
+func getPosition(_ el: AXUIElement) -> CGPoint? {
+    guard let val = getAttr(el, kAXPositionAttribute) else { return nil }
+    var pt = CGPoint.zero
+    guard AXValueGetValue(val as! AXValue, .cgPoint, &pt) else { return nil }
+    return pt
+}
+
+func getSize(_ el: AXUIElement) -> CGSize? {
+    guard let val = getAttr(el, kAXSizeAttribute) else { return nil }
+    var sz = CGSize.zero
+    guard AXValueGetValue(val as! AXValue, .cgSize, &sz) else { return nil }
+    return sz
+}
+
+func getLabel(_ el: AXUIElement) -> String {
+    if let d = getAttr(el, kAXDescriptionAttribute) as? String, !d.isEmpty { return d }
+    if let t = getAttr(el, kAXTitleAttribute) as? String, !t.isEmpty { return t }
+    if let v = getAttr(el, kAXValueAttribute) as? String, !v.isEmpty { return v }
+    return ""
+}
+
+func getRole(_ el: AXUIElement) -> String {
+    return (getAttr(el, kAXRoleAttribute) as? String) ?? ""
+}
+
+var results: [String] = []
+
+func enumerate(_ el: AXUIElement, depth: Int = 0) {
+    guard depth < 25 else { return }
+
+    let pos = getPosition(el)
+    let sz  = getSize(el)
+    let label = getLabel(el)
+    let role  = getRole(el)
+
+    if let p = pos, let s = sz, s.width >= 5, s.height >= 5 {
+        let lx = Int(round((p.x - screenX) / zoom))
+        let ly = Int(round((p.y - screenY) / zoom))
+        let lw = Int(round(s.width / zoom))
+        let lh = Int(round(s.height / zoom))
+        if !role.isEmpty || !label.isEmpty {
+            if !interactiveOnly || interactiveRoles.contains(role) {
+                let safeLabel = label
+                    .replacingOccurrences(of: "\\", with: "\\\\")
+                    .replacingOccurrences(of: "\"", with: "\\\"")
+                results.append(
+                    "{\"role\":\"\(role)\",\"label\":\"\(safeLabel)\",\"x\":\(lx),\"y\":\(ly),\"w\":\(lw),\"h\":\(lh)}"
+                )
+            }
+        }
+    }
+
+    // Fetch children — for Tab Bar groups, also probe AXTabs (UITabBarButton items
+    // are not exposed via kAXChildrenAttribute on the iOS Simulator AX bridge)
+    var childrenRef: CFTypeRef?
+    AXUIElementCopyAttributeValue(el, kAXChildrenAttribute as CFString, &childrenRef)
+    var children = (childrenRef as? [AXUIElement]) ?? []
+
+    if children.isEmpty && role == "AXGroup" && label == "Tab Bar" {
+        var tabsRef: CFTypeRef?
+        AXUIElementCopyAttributeValue(el, "AXTabs" as CFString, &tabsRef)
+        if let tabs = tabsRef as? [AXUIElement] {
+            children = tabs
+        }
+    }
+
+    for child in children {
+        enumerate(child, depth: depth + 1)
+    }
+}
+
+enumerate(win)
+print("[\(results.joined(separator: ","))]")
+SWIFTEOF
+}
+
+cmd_screen_title() {
+  _bootstrap
+  swift - "${SIM_SCREEN_X}" "${SIM_SCREEN_Y}" "${SIM_SCREEN_W}" "${SIM_ZOOM}" "${SIM_NAME} – ${SIM_OS}" << 'SWIFTEOF' 2>/dev/null
+import Cocoa
+import ApplicationServices
+
+let args = CommandLine.arguments
+let screenX  = Double(args.count > 1 ? args[1] : "0") ?? 0.0
+let screenY  = Double(args.count > 2 ? args[2] : "0") ?? 0.0
+let screenW  = Double(args.count > 3 ? args[3] : "393") ?? 393.0
+let zoom     = Double(args.count > 4 ? args[4] : "1.0") ?? 1.0
+let deviceName = args.count > 5 ? args[5] : ""
+
+func getAttribute(_ el: AXUIElement, _ attr: String) -> CFTypeRef? {
+    var v: CFTypeRef?
+    AXUIElementCopyAttributeValue(el, attr as CFString, &v)
+    return v
+}
+
+func getRole(_ el: AXUIElement) -> String {
+    return (getAttribute(el, "AXRole") as? String) ?? ""
+}
+
+func getRoleDesc(_ el: AXUIElement) -> String {
+    return (getAttribute(el, "AXRoleDescription") as? String) ?? ""
+}
+
+func getTitle(_ el: AXUIElement) -> String {
+    for attr in ["AXTitle", "AXLabel", "AXDescription", "AXValue"] {
+        if let v = getAttribute(el, attr) as? String, !v.isEmpty { return v }
+    }
+    return ""
+}
+
+func getPosition(_ el: AXUIElement) -> CGPoint? {
+    guard let posVal = getAttribute(el, "AXPosition") else { return nil }
+    var pt = CGPoint.zero
+    guard AXValueGetValue(posVal as! AXValue, .cgPoint, &pt) else { return nil }
+    return pt
+}
+
+func getSize(_ el: AXUIElement) -> CGSize? {
+    guard let sizeVal = getAttribute(el, "AXSize") else { return nil }
+    var sz = CGSize.zero
+    guard AXValueGetValue(sizeVal as! AXValue, .cgSize, &sz) else { return nil }
+    return sz
+}
+
+guard let app = NSRunningApplication.runningApplications(
+    withBundleIdentifier: "com.apple.iphonesimulator").first else {
+    print("unknown"); exit(0)
+}
+let axApp = AXUIElementCreateApplication(app.processIdentifier)
+guard let windows = getAttribute(axApp, "AXWindows") as? [AXUIElement],
+      !windows.isEmpty else {
+    print("unknown"); exit(0)
+}
+
+func pickWindow(_ windows: [AXUIElement], screenX: Double, screenY: Double, deviceName: String) -> AXUIElement? {
+    // Primary: find the window whose bounds contain the known screen origin.
+    // SIM_SCREEN_X/Y are the macOS screen coords of the iOS screen surface — unique per window.
+    for win in windows {
+        var posRef: CFTypeRef?
+        var sizeRef: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(win, kAXPositionAttribute as CFString, &posRef) == .success,
+              AXUIElementCopyAttributeValue(win, kAXSizeAttribute as CFString, &sizeRef) == .success,
+              let pv = posRef, let sv = sizeRef else { continue }
+        var pt = CGPoint.zero; var sz = CGSize.zero
+        AXValueGetValue(pv as! AXValue, .cgPoint, &pt)
+        AXValueGetValue(sv as! AXValue, .cgSize, &sz)
+        if screenX >= Double(pt.x) && screenX <= Double(pt.x + sz.width) &&
+           screenY >= Double(pt.y) && screenY <= Double(pt.y + sz.height) {
+            return win
+        }
+    }
+    // Fallback: match by title containing device name
+    for win in windows {
+        var titleRef: CFTypeRef?
+        if AXUIElementCopyAttributeValue(win, kAXTitleAttribute as CFString, &titleRef) == .success,
+           let title = titleRef as? String, title.contains(deviceName) { return win }
+    }
+    return windows.first
+}
+
+guard let window = pickWindow(windows, screenX: screenX, screenY: screenY, deviceName: deviceName) else {
+    print("unknown"); exit(0)
+}
+
+// Depth-first search for a navigation bar element.
+// Matches both UIKit (AXNavigationBar) and SwiftUI (AXGroup with AXRoleDescription="Nav bar").
+// Returns the nav bar element if found.
+func findNavBar(_ el: AXUIElement, _ depth: Int) -> AXUIElement? {
+    if depth < 0 { return nil }
+    let role = getRole(el)
+    if role == "AXNavigationBar" { return el }
+    if role == "AXGroup" && getRoleDesc(el) == "Nav bar" { return el }
+    guard let children = getAttribute(el, "AXChildren") as? [AXUIElement] else { return nil }
+    for child in children {
+        if let found = findNavBar(child, depth - 1) { return found }
+    }
+    return nil
+}
+
+// Search up to 25 levels deep for a navigation bar
+if let navBar = findNavBar(window, 25) {
+    // Strategy 1: child AXStaticText or AXHeading of the nav bar via kAXChildrenAttribute
+    if let children = getAttribute(navBar, "AXChildren") as? [AXUIElement] {
+        for child in children {
+            let r = getRole(child)
+            if r == "AXStaticText" || r == "AXHeading" {
+                let t = getTitle(child)
+                if !t.isEmpty { print(t); exit(0) }
+            }
+        }
+    }
+
+    // Strategy 2: probe the center of the nav bar using AXUIElementCopyElementAtPosition.
+    // iOS Simulator's AX bridge sometimes omits nav title children from kAXChildrenAttribute
+    // but the element IS hit-testable at its screen position.
+    if let pos = getPosition(navBar), let sz = getSize(navBar) {
+        // Sample a few points across the center of the nav bar to find the title
+        let centerY = Float(pos.y + sz.height / 2)
+        let sampleXs: [Float] = [
+            Float(pos.x + sz.width * 0.5),   // center
+            Float(pos.x + sz.width * 0.35),  // slight left of center
+            Float(pos.x + sz.width * 0.65),  // slight right of center
+        ]
+        for sampleX in sampleXs {
+            var hitEl: AXUIElement?
+            let err = AXUIElementCopyElementAtPosition(axApp, sampleX, centerY, &hitEl)
+            if err == .success, let el = hitEl {
+                let r = getRole(el)
+                // Accept AXStaticText or AXHeading; skip the nav bar group itself
+                if r == "AXStaticText" || r == "AXHeading" {
+                    let t = getTitle(el)
+                    if !t.isEmpty { print(t); exit(0) }
+                }
+            }
+        }
+    }
+
+    // Strategy 3: nav bar's own AX label (rare but possible)
+    let title = getTitle(navBar)
+    if !title.isEmpty { print(title); exit(0) }
+}
+
+// No nav bar found — probe the top ~100pt band of the screen with hit-testing.
+// This catches screens with inline/large title navigation or custom headers.
+let navBandTop    = Float(screenY + 40 * zoom)
+let navBandBottom = Float(screenY + 110 * zoom)
+let centerX       = Float(screenX + screenW / 2)
+let probeYs: [Float] = [
+    Float((Double(navBandTop) + Double(navBandBottom)) / 2),
+    navBandTop + Float(10 * zoom),
+    navBandBottom - Float(10 * zoom),
+]
+for probeY in probeYs {
+    var hitEl: AXUIElement?
+    let err = AXUIElementCopyElementAtPosition(axApp, centerX, probeY, &hitEl)
+    if err == .success, let el = hitEl {
+        let r = getRole(el)
+        if r == "AXStaticText" || r == "AXHeading" {
+            let t = getTitle(el)
+            if !t.isEmpty && t.count > 1 { print(t); exit(0) }
+        }
+    }
+}
+
+// Last resort: AXHeading in the top-300pt band via tree walk
+func findTopHeading(_ el: AXUIElement, _ depth: Int) -> String? {
+    if depth < 0 { return nil }
+    if getRole(el) == "AXHeading" {
+        if let pos = getPosition(el) {
+            if pos.y < CGFloat(screenY + 300 * zoom) {
+                let t = getTitle(el)
+                if !t.isEmpty { return t }
+            }
+        }
+    }
+    guard let children = getAttribute(el, "AXChildren") as? [AXUIElement] else { return nil }
+    for child in children {
+        if let found = findTopHeading(child, depth - 1) { return found }
+    }
+    return nil
+}
+
+if let title = findTopHeading(window, 25) {
+    print(title)
+    exit(0)
+}
+
+// Strategy 5: Broadened scan — topmost prominent AXStaticText in top 200pt
+// Returns with ~ prefix to signal heuristic match
+func findProminentText(_ el: AXUIElement, _ depth: Int) -> (String, CGFloat, CGFloat)? {
+    if depth < 0 { return nil }
+    let role = getRole(el)
+    if role == "AXStaticText" || role == "AXHeading" {
+        if let pos = getPosition(el), let sz = getSize(el) {
+            if pos.y >= CGFloat(screenY + 40 * zoom) &&
+               pos.y < CGFloat(screenY + 300 * zoom) && sz.height >= 14 {
+                let t = getTitle(el)
+                if !t.isEmpty && t.count >= 3 { return (t, pos.y, sz.height) }
+            }
+        }
+    }
+    guard let children = getAttribute(el, "AXChildren") as? [AXUIElement] else { return nil }
+    var best: (String, CGFloat, CGFloat)? = nil
+    for child in children {
+        if let found = findProminentText(child, depth - 1) {
+            if best == nil || found.1 < best!.1 || (found.1 == best!.1 && found.2 > best!.2) {
+                best = found
+            }
+        }
+    }
+    return best
+}
+
+if let (text, _, _) = findProminentText(window, 25) {
+    print("~\(text)")
+    exit(0)
+}
+
+print("unknown")
+SWIFTEOF
+}
+
+cmd_find_element() {
+  [[ $# -ge 1 ]] || die "Usage: sim.sh find-element <label>"
+  local search_label="$1"
+  _bootstrap
+
+  local result
+  result=$(swift - << EOF 2>/dev/null
+import Cocoa
+import ApplicationServices
+
+let searchLabel = "${search_label}"
+let screenX = Double(${SIM_SCREEN_X})
+let screenY = Double(${SIM_SCREEN_Y})
+let zoom = ${SIM_ZOOM}
+let deviceName = "${SIM_NAME} – ${SIM_OS}"
+
+func getAttribute(_ el: AXUIElement, _ attr: String) -> CFTypeRef? {
+    var v: CFTypeRef?
+    AXUIElementCopyAttributeValue(el, attr as CFString, &v)
+    return v
+}
+
+func getLabel(_ el: AXUIElement) -> String {
+    for attr in ["AXDescription", "AXTitle", "AXLabel", "AXValue"] {
+        if let v = getAttribute(el, attr) as? String, !v.isEmpty { return v }
+    }
+    return ""
+}
+
+func toLogical(_ screenVal: CGFloat, _ origin: Double) -> Int {
+    return Int((screenVal - CGFloat(origin)) / CGFloat(zoom) + 0.5)
+}
+
+func search(_ el: AXUIElement, _ depth: Int) -> String? {
+    guard depth >= 0 else { return nil }
+    let label = getLabel(el)
+    if label.localizedCaseInsensitiveContains(searchLabel) {
+        let role = (getAttribute(el, "AXRole") as? String) ?? ""
+        if let posVal = getAttribute(el, "AXPosition"),
+           let sizeVal = getAttribute(el, "AXSize") {
+            var pos = CGPoint.zero; var sz = CGSize.zero
+            AXValueGetValue(posVal as! AXValue, .cgPoint, &pos)
+            AXValueGetValue(sizeVal as! AXValue, .cgSize, &sz)
+            let lx = toLogical(pos.x, screenX)
+            let ly = toLogical(pos.y, screenY)
+            let lw = Int(sz.width / CGFloat(zoom) + 0.5)
+            let lh = Int(sz.height / CGFloat(zoom) + 0.5)
+            let safeLabel = label
+                .replacingOccurrences(of: "\\\\", with: "\\\\\\\\")
+                .replacingOccurrences(of: "\"", with: "\\\\\"")
+            return "{\"role\":\"\(role)\",\"label\":\"\(safeLabel)\",\"x\":\(lx),\"y\":\(ly),\"w\":\(lw),\"h\":\(lh)}"
+        }
+    }
+    guard let children = getAttribute(el, "AXChildren") as? [AXUIElement] else { return nil }
+    for child in children {
+        if let found = search(child, depth - 1) { return found }
+    }
+    return nil
+}
+
+func pickWindow(_ windows: [AXUIElement], screenX: Double, screenY: Double, deviceName: String) -> AXUIElement? {
+    // Primary: find the window whose bounds contain the known screen origin.
+    // SIM_SCREEN_X/Y are the macOS screen coords of the iOS screen surface — unique per window.
+    for win in windows {
+        var posRef: CFTypeRef?
+        var sizeRef: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(win, kAXPositionAttribute as CFString, &posRef) == .success,
+              AXUIElementCopyAttributeValue(win, kAXSizeAttribute as CFString, &sizeRef) == .success,
+              let pv = posRef, let sv = sizeRef else { continue }
+        var pt = CGPoint.zero; var sz = CGSize.zero
+        AXValueGetValue(pv as! AXValue, .cgPoint, &pt)
+        AXValueGetValue(sv as! AXValue, .cgSize, &sz)
+        if screenX >= Double(pt.x) && screenX <= Double(pt.x + sz.width) &&
+           screenY >= Double(pt.y) && screenY <= Double(pt.y + sz.height) {
+            return win
+        }
+    }
+    // Fallback: match by title containing device name
+    for win in windows {
+        var titleRef: CFTypeRef?
+        if AXUIElementCopyAttributeValue(win, kAXTitleAttribute as CFString, &titleRef) == .success,
+           let title = titleRef as? String, title.contains(deviceName) { return win }
+    }
+    return windows.first
+}
+
+let pid = NSRunningApplication.runningApplications(withBundleIdentifier: "com.apple.iphonesimulator").first!.processIdentifier
+let app = AXUIElementCreateApplication(pid)
+guard let windows = getAttribute(app, "AXWindows") as? [AXUIElement],
+      let window = pickWindow(windows, screenX: screenX, screenY: screenY, deviceName: deviceName) else {
+    fputs("ERROR: no window\n", stderr); exit(1)
+}
+
+// Try primary window first
+if let match = search(window, 30) {
+    print(match)
+    exit(0)
+}
+// Fall back: search remaining windows (covers modal sheets, overlays)
+for win in windows where win !== window {
+    if let match = search(win, 30) {
+        print(match)
+        exit(0)
+    }
+}
+fputs("ERROR: element not found: \(searchLabel)\n", stderr)
+exit(1)
+EOF
+  )
+
+  local swift_exit=$?
+  if [[ $swift_exit -ne 0 ]] || [[ -z "$result" ]]; then
+    die "find-element: element not found: $search_label"
+  fi
+  echo "$result"
+}
+
+cmd_describe_point() {
+  [[ $# -ge 2 ]] || die "Usage: sim.sh describe-point <x> <y>"
+  _is_integer "$1" || die "describe-point: x must be an integer, got: $1"
+  _is_integer "$2" || die "describe-point: y must be an integer, got: $2"
+  _bootstrap
+  local sx sy
+  sx=$(to_screen_x "$1")
+  sy=$(to_screen_y "$2")
+
+  local result
+  result=$(swift - "$sx" "$sy" "$SIM_SCREEN_X" "$SIM_SCREEN_Y" "$SIM_ZOOM" "${SIM_NAME} – ${SIM_OS}" 2>/dev/null << 'SWIFTEOF'
+import ApplicationServices
+import AppKit
+import Foundation
+
+let args = CommandLine.arguments
+let screenX    = Double(args[1])!
+let screenY    = Double(args[2])!
+let originX    = Double(args[3])!
+let originY    = Double(args[4])!
+let zoom       = Double(args[5])!
+let deviceName = args.count > 6 ? args[6] : ""
+
+guard let simApp = NSWorkspace.shared.runningApplications
+    .first(where: { $0.bundleIdentifier == "com.apple.iphonesimulator" }) else {
+    fputs("ERROR: Simulator not running\n", stderr); exit(1)
+}
+let pid = simApp.processIdentifier
+let axApp = AXUIElementCreateApplication(pid)
+
+func getAttr(_ el: AXUIElement, _ attr: String) -> AnyObject? {
+    var v: CFTypeRef?
+    guard AXUIElementCopyAttributeValue(el, attr as CFString, &v) == .success else { return nil }
+    return v as AnyObject
+}
+func getLabel(_ el: AXUIElement) -> String {
+    for a in ["AXDescription", "AXTitle", "AXLabel", "AXValue"] {
+        if let s = getAttr(el, a) as? String, !s.isEmpty { return s }
+    }
+    return ""
+}
+func getRole(_ el: AXUIElement) -> String {
+    return (getAttr(el, kAXRoleAttribute) as? String) ?? ""
+}
+
+var element: AXUIElement?
+let err = AXUIElementCopyElementAtPosition(axApp, Float(screenX), Float(screenY), &element)
+guard err == .success, let el = element else {
+    fputs("ERROR: no element at point (\(Int(screenX)), \(Int(screenY)))\n", stderr)
+    exit(1)
+}
+
+let role  = getRole(el)
+let label = getLabel(el)
+
+var lx = 0, ly = 0, lw = 0, lh = 0
+if let posVal = getAttr(el, kAXPositionAttribute) {
+    var pt = CGPoint.zero
+    AXValueGetValue(posVal as! AXValue, .cgPoint, &pt)
+    lx = Int((pt.x - originX) / zoom + 0.5)
+    ly = Int((pt.y - originY) / zoom + 0.5)
+}
+if let sizeVal = getAttr(el, kAXSizeAttribute) {
+    var sz = CGSize.zero
+    AXValueGetValue(sizeVal as! AXValue, .cgSize, &sz)
+    lw = Int(sz.width / zoom + 0.5)
+    lh = Int(sz.height / zoom + 0.5)
+}
+
+let safeLabel = label
+    .replacingOccurrences(of: "\\", with: "\\\\")
+    .replacingOccurrences(of: "\"", with: "\\\"")
+print("{\"role\":\"\(role)\",\"label\":\"\(safeLabel)\",\"x\":\(lx),\"y\":\(ly),\"w\":\(lw),\"h\":\(lh)}")
+SWIFTEOF
+  )
+
+  local swift_exit=$?
+  if [[ $swift_exit -ne 0 ]] || [[ -z "$result" ]] || [[ "$result" == ERROR:* ]]; then
+    die "describe-point: ${result:-no element found at ($1, $2)}"
+  fi
+  echo "$result"
+}
+
+cmd_layout_map() {
+  _bootstrap
+  local tmp_out
+  tmp_out=$(mktemp /tmp/sim_layout_XXXXXX)
+  swift - "$SIM_SCREEN_X" "$SIM_SCREEN_Y" "$SIM_SCREEN_W" "$SIM_SCREEN_H" "$SIM_ZOOM" "${SIM_NAME} – ${SIM_OS}" "$tmp_out" 2>/dev/null << 'SWIFTEOF'
+import ApplicationServices
+import AppKit
+import Foundation
+
+let args = CommandLine.arguments
+let originX    = Double(args.count > 1 ? args[1] : "0")  ?? 0.0
+let originY    = Double(args.count > 2 ? args[2] : "0")  ?? 0.0
+let screenW    = Double(args.count > 3 ? args[3] : "390") ?? 390.0
+let screenH    = Double(args.count > 4 ? args[4] : "844") ?? 844.0
+let zoom       = Double(args.count > 5 ? args[5] : "1.0") ?? 1.0
+let deviceName = args.count > 6 ? args[6] : ""
+let outputPath = args.count > 7 ? args[7] : ""
+
+// ── AX helpers ────────────────────────────────────────────────────────────────
+
+func getAttr(_ el: AXUIElement, _ attr: String) -> AnyObject? {
+    var v: CFTypeRef?
+    guard AXUIElementCopyAttributeValue(el, attr as CFString, &v) == .success else { return nil }
+    return v as AnyObject
+}
+func getChildren(_ el: AXUIElement) -> [AXUIElement] {
+    return (getAttr(el, kAXChildrenAttribute) as? [AXUIElement]) ?? []
+}
+func getRole(_ el: AXUIElement) -> String {
+    return (getAttr(el, kAXRoleAttribute) as? String) ?? ""
+}
+func getRoleDesc(_ el: AXUIElement) -> String {
+    return (getAttr(el, kAXRoleDescriptionAttribute) as? String) ?? ""
+}
+func getLabel(_ el: AXUIElement) -> String {
+    for a in ["AXDescription", "AXTitle", "AXLabel"] {
+        if let s = getAttr(el, a) as? String, !s.isEmpty { return s }
+    }
+    return ""
+}
+func getValue(_ el: AXUIElement) -> String? {
+    return getAttr(el, kAXValueAttribute) as? String
+}
+func isEnabled(_ el: AXUIElement) -> Bool {
+    return (getAttr(el, kAXEnabledAttribute) as? Bool) ?? true
+}
+
+struct Rect { var x: Int; var y: Int; var w: Int; var h: Int }
+
+func getRect(_ el: AXUIElement) -> Rect? {
+    guard let posVal  = getAttr(el, kAXPositionAttribute),
+          let sizeVal = getAttr(el, kAXSizeAttribute) else { return nil }
+    var pt = CGPoint.zero; var sz = CGSize.zero
+    guard AXValueGetValue(posVal  as! AXValue, .cgPoint, &pt),
+          AXValueGetValue(sizeVal as! AXValue, .cgSize,  &sz) else { return nil }
+    let lx = Int((pt.x - originX) / zoom + 0.5)
+    let ly = Int((pt.y - originY) / zoom + 0.5)
+    let lw = Int(sz.width  / zoom + 0.5)
+    let lh = Int(sz.height / zoom + 0.5)
+    return Rect(x: lx, y: ly, w: lw, h: lh)
+}
+
+func screenRect(_ el: AXUIElement) -> (CGPoint, CGSize)? {
+    guard let posVal  = getAttr(el, kAXPositionAttribute),
+          let sizeVal = getAttr(el, kAXSizeAttribute) else { return nil }
+    var pt = CGPoint.zero; var sz = CGSize.zero
+    guard AXValueGetValue(posVal  as! AXValue, .cgPoint, &pt),
+          AXValueGetValue(sizeVal as! AXValue, .cgSize,  &sz) else { return nil }
+    return (pt, sz)
+}
+
+func escJson(_ s: String) -> String {
+    return s
+        .replacingOccurrences(of: "\\", with: "\\\\")
+        .replacingOccurrences(of: "\"", with: "\\\"")
+        .replacingOccurrences(of: "\n", with: "\\n")
+        .replacingOccurrences(of: "\r", with: "\\r")
+        .replacingOccurrences(of: "\t", with: "\\t")
+}
+
+// ── Window picking (same pattern as other commands) ───────────────────────────
+
+guard let simApp = NSWorkspace.shared.runningApplications
+    .first(where: { $0.bundleIdentifier == "com.apple.iphonesimulator" }) else {
+    fputs("ERROR: Simulator not running\n", stderr); exit(1)
+}
+let pid   = simApp.processIdentifier
+let axApp = AXUIElementCreateApplication(pid)
+
+guard let windows = getAttr(axApp, kAXWindowsAttribute) as? [AXUIElement],
+      !windows.isEmpty else {
+    fputs("ERROR: no windows\n", stderr); exit(1)
+}
+
+func pickWindow(_ wins: [AXUIElement]) -> AXUIElement? {
+    for win in wins {
+        guard let (pt, sz) = screenRect(win) else { continue }
+        if originX >= Double(pt.x) && originX <= Double(pt.x + sz.width) &&
+           originY >= Double(pt.y) && originY <= Double(pt.y + sz.height) {
+            return win
+        }
+    }
+    for win in wins {
+        if let t = getAttr(win, kAXTitleAttribute) as? String, t.contains(deviceName) { return win }
+    }
+    return wins.first
+}
+
+guard let window = pickWindow(windows) else {
+    fputs("ERROR: window not found\n", stderr); exit(1)
+}
+
+// ── Screen bounds in macOS coords ─────────────────────────────────────────────
+
+let screenBottom = originY + screenH * zoom   // macOS y of iOS bottom edge
+let screenTop    = originY                    // macOS y of iOS top edge
+let screenLeft   = originX
+let screenRight  = originX + screenW * zoom
+
+// Visible band in iOS logical coords: y between 50pt and (screenH - 80pt)
+let visibleMinY = 50
+let visibleMaxY = Int(screenH) - 80
+
+// ── Nav bar search ────────────────────────────────────────────────────────────
+
+func findNavBar(_ el: AXUIElement, _ depth: Int) -> AXUIElement? {
+    if depth < 0 { return nil }
+    let role = getRole(el)
+    if role == "AXNavigationBar" { return el }
+    if role == "AXGroup" && getRoleDesc(el) == "Nav bar" { return el }
+    for child in getChildren(el) {
+        if let found = findNavBar(child, depth - 1) { return found }
+    }
+    return nil
+}
+
+let navBar = findNavBar(window, 25)
+let hasNavBar = navBar != nil
+
+// ── Screen title ──────────────────────────────────────────────────────────────
+
+var screenTitle = "unknown"
+var navTitle: String? = nil
+
+if let nb = navBar {
+    // Strategy 1: children of nav bar
+    for child in getChildren(nb) {
+        let r = getRole(child)
+        if r == "AXStaticText" || r == "AXHeading" {
+            let t = getLabel(child)
+            if !t.isEmpty { navTitle = t; screenTitle = t; break }
+        }
+    }
+
+    // Strategy 2: hit-test center of nav bar
+    if navTitle == nil, let (pos, sz) = screenRect(nb) {
+        let centerY = Float(pos.y + sz.height / 2)
+        let sampleXs: [Float] = [
+            Float(pos.x + sz.width * 0.5),
+            Float(pos.x + sz.width * 0.35),
+            Float(pos.x + sz.width * 0.65),
+        ]
+        outer: for sx in sampleXs {
+            var hitEl: AXUIElement?
+            if AXUIElementCopyElementAtPosition(axApp, sx, centerY, &hitEl) == .success, let el = hitEl {
+                let r = getRole(el)
+                if r == "AXStaticText" || r == "AXHeading" {
+                    let t = getLabel(el)
+                    if !t.isEmpty { navTitle = t; screenTitle = t; break outer }
+                }
+            }
+        }
+    }
+
+    // Strategy 3: nav bar own label
+    if navTitle == nil {
+        let t = getLabel(nb)
+        if !t.isEmpty { navTitle = t; screenTitle = t }
+    }
+}
+
+// Strategy 4: probe top band (y 40–110pt) via hit-test
+if screenTitle == "unknown" {
+    let topBandTop    = Float(screenTop + 40 * zoom)
+    let topBandBottom = Float(screenTop + 110 * zoom)
+    let centerX       = Float(screenLeft + screenW * zoom / 2)
+    let probeYs: [Float] = [
+        (topBandTop + topBandBottom) / 2,
+        topBandTop + Float(10 * zoom),
+        topBandBottom - Float(10 * zoom),
+    ]
+    for py in probeYs {
+        var hitEl: AXUIElement?
+        if AXUIElementCopyElementAtPosition(axApp, centerX, py, &hitEl) == .success, let el = hitEl {
+            let r = getRole(el)
+            if (r == "AXStaticText" || r == "AXHeading") {
+                let t = getLabel(el)
+                if !t.isEmpty && t.count > 1 { screenTitle = t; break }
+            }
+        }
+    }
+}
+
+// Strategy 5: first AXHeading in top 300pt
+func findTopHeading(_ el: AXUIElement, _ depth: Int) -> String? {
+    if depth < 0 { return nil }
+    if getRole(el) == "AXHeading" {
+        if let (pos, _) = screenRect(el), pos.y < CGFloat(screenTop + 300 * zoom) {
+            let t = getLabel(el)
+            if !t.isEmpty { return t }
+        }
+    }
+    for child in getChildren(el) {
+        if let found = findTopHeading(child, depth - 1) { return found }
+    }
+    return nil
+}
+if screenTitle == "unknown" {
+    if let t = findTopHeading(window, 25) { screenTitle = t }
+}
+
+// Strategy 6: prominent static text in top 300pt (heuristic, prefix ~)
+func findProminentText(_ el: AXUIElement, _ depth: Int) -> (String, CGFloat, CGFloat)? {
+    if depth < 0 { return nil }
+    let role = getRole(el)
+    if role == "AXStaticText" || role == "AXHeading" {
+        if let (pos, sz) = screenRect(el),
+           pos.y >= CGFloat(screenTop + 40 * zoom) &&
+           pos.y <  CGFloat(screenTop + 300 * zoom) && sz.height >= 14 {
+            let t = getLabel(el)
+            if !t.isEmpty && t.count >= 3 { return (t, pos.y, sz.height) }
+        }
+    }
+    var best: (String, CGFloat, CGFloat)? = nil
+    for child in getChildren(el) {
+        if let f = findProminentText(child, depth - 1) {
+            if best == nil || f.1 < best!.1 || (f.1 == best!.1 && f.2 > best!.2) { best = f }
+        }
+    }
+    return best
+}
+if screenTitle == "unknown" {
+    if let (t, _, _) = findProminentText(window, 25) { screenTitle = "~\(t)" }
+}
+
+// ── Back button detection ─────────────────────────────────────────────────────
+
+struct BackInfo { var label: String; var x: Int; var y: Int }
+var backInfo: BackInfo? = nil
+
+// Strategy 1: search nav bar children
+// Condition A: label case-insensitively contains the substring "back" (catches "Back", "icoBack", "backButton", "go-back")
+// Condition B: first AXButton child of nav bar with empty label (chevron/arrow image)
+func isBackLabelNav(_ lbl: String) -> Bool {
+    return lbl.lowercased().contains("back")
+}
+if let nb = navBar {
+    let navChildren = getChildren(nb)
+    var firstButton: AXUIElement? = nil
+    for child in navChildren {
+        let r = getRole(child)
+        if r == "AXButton" {
+            if firstButton == nil { firstButton = child }
+            let lbl = getLabel(child)
+            if isBackLabelNav(lbl) {
+                if let rect = getRect(child) {
+                    backInfo = BackInfo(label: lbl, x: rect.x + rect.w/2, y: rect.y + rect.h/2)
+                    break
+                }
+            }
+        }
+    }
+    // Condition B: first AXButton with empty label (chevron back button)
+    if backInfo == nil, let fb = firstButton {
+        let lbl = getLabel(fb)
+        if lbl.isEmpty {
+            if let rect = getRect(fb) {
+                backInfo = BackInfo(label: "Back", x: rect.x + rect.w/2, y: rect.y + rect.h/2)
+            }
+        }
+    }
+}
+
+// Strategy 2: walk full AX tree for any button whose label matches back-button patterns.
+// Matches: "Back", "back", "icoBack", "backButton", "BackButton", "go-back" etc.
+// Rule: label case-insensitively contains the substring "back"
+if backInfo == nil {
+    func isBackLabel(_ lbl: String) -> Bool {
+        return lbl.lowercased().contains("back")
+    }
+    func findBackInTree(_ el: AXUIElement, _ depth: Int) -> BackInfo? {
+        if depth < 0 { return nil }
+        if getRole(el) == "AXButton" {
+            let lbl = getLabel(el)
+            if isBackLabel(lbl) {
+                if let rect = getRect(el) {
+                    return BackInfo(label: lbl, x: rect.x + rect.w/2, y: rect.y + rect.h/2)
+                }
+            }
+        }
+        for child in getChildren(el) {
+            if let found = findBackInTree(child, depth - 1) { return found }
+        }
+        return nil
+    }
+    backInfo = findBackInTree(window, 25)
+}
+
+// ── Tab bar detection (hit-test, AX tree misses UITabBar children) ────────────
+
+struct TabItem { var label: String; var x: Int; var y: Int; var selected: Bool }
+var tabs: [TabItem] = []
+
+// Strategy: walk AX tree to find the AXGroup labeled "Tab Bar" and read its position.
+// If found, probe at tabBar.y + tabBar.height/2 (macOS coords).
+// Fallback: probe at screenOriginY + (logicalH - 30pt) * zoom.
+
+func findTabBarGroup(_ el: AXUIElement, _ depth: Int) -> AXUIElement? {
+    if depth < 0 { return nil }
+    let role = getRole(el)
+    if role == "AXGroup" {
+        let lbl = getLabel(el)
+        if lbl == "Tab Bar" { return el }
+    }
+    for child in getChildren(el) {
+        if let found = findTabBarGroup(child, depth - 1) { return found }
+    }
+    return nil
+}
+
+var tabProbeY: Float
+if let tbGroup = findTabBarGroup(window, 25),
+   let (tbPos, tbSize) = screenRect(tbGroup) {
+    // Use actual tab bar midY in macOS screen coords
+    tabProbeY = Float(tbPos.y + tbSize.height / 2)
+} else {
+    // Fallback: 30pt from bottom of logical screen
+    tabProbeY = Float(originY + (screenH - 30) * zoom)
+}
+
+let tabFractions: [Double] = [0.10, 0.22, 0.35, 0.48, 0.61, 0.74, 0.87]
+var seenTabLabels = Set<String>()
+
+for frac in tabFractions {
+    let px = Float(screenLeft + screenW * zoom * frac)
+    var hitEl: AXUIElement?
+    if AXUIElementCopyElementAtPosition(axApp, px, tabProbeY, &hitEl) == .success, let el = hitEl {
+        let r = getRole(el)
+        if r == "AXRadioButton" || r == "AXButton" {
+            let lbl = getLabel(el)
+            if !lbl.isEmpty && !seenTabLabels.contains(lbl) {
+                seenTabLabels.insert(lbl)
+                let selected = (getAttr(el, kAXValueAttribute) as? Int) == 1
+                if let rect = getRect(el) {
+                    tabs.append(TabItem(label: lbl, x: rect.x + rect.w/2, y: rect.y + rect.h/2, selected: selected))
+                }
+            }
+        }
+    }
+}
+
+// ── Modal detection ───────────────────────────────────────────────────────────
+
+var isModal = false
+if !hasNavBar {
+    // Look for close/dismiss button in top area
+    func hasCloseButton(_ el: AXUIElement, _ depth: Int) -> Bool {
+        if depth < 0 { return false }
+        if getRole(el) == "AXButton" {
+            let lbl = getLabel(el)
+            let lower = lbl.lowercased()
+            if lower.contains("close") || lower.contains("dismiss") || lbl.contains("NGRoundedCloseButton") {
+                return true
+            }
+        }
+        for child in getChildren(el) {
+            if hasCloseButton(child, depth - 1) { return true }
+        }
+        return false
+    }
+    isModal = hasCloseButton(window, 20)
+}
+
+// ── Interactive element collection ───────────────────────────────────────────
+
+let interactiveRoles: Set<String> = [
+    "AXButton", "AXTextField", "AXSecureTextField", "AXLink",
+    "AXSwitch", "AXCheckBox", "AXSlider", "AXRadioButton"
+]
+
+struct InteractiveEl {
+    var role: String; var label: String
+    var x: Int; var y: Int; var w: Int; var h: Int
+    var value: String?; var enabled: Bool
+}
+var interactives: [InteractiveEl] = []
+var seenInteractiveKeys = Set<String>()
+
+func collectInteractive(_ el: AXUIElement, _ depth: Int) {
+    if depth < 0 { return }
+    let role = getRole(el)
+    if interactiveRoles.contains(role) {
+        let lbl = getLabel(el)
+        let key = "\(role)|\(lbl)"
+        // Skip known simulator hardware button labels
+        let hardwareLabels: Set<String> = ["Action", "Volume Up", "Volume Down", "Sleep/Wake", "Side Button"]
+        if !seenInteractiveKeys.contains(key) && !hardwareLabels.contains(lbl) {
+            if let rect = getRect(el) {
+                // Must be within logical screen bounds (excludes hardware buttons at negative x or x > screenW)
+                if rect.x >= 0 && rect.x <= Int(screenW) &&
+                   rect.y >= visibleMinY - 50 && rect.y <= visibleMaxY + 50 &&
+                   rect.w > 0 && rect.h > 0 {
+                    seenInteractiveKeys.insert(key)
+                    let val = getValue(el)
+                    let enabled = isEnabled(el)
+                    interactives.append(InteractiveEl(
+                        role: role, label: lbl,
+                        x: rect.x, y: rect.y,
+                        w: rect.w, h: rect.h,
+                        value: val, enabled: enabled
+                    ))
+                }
+            }
+        }
+    }
+    for child in getChildren(el) {
+        collectInteractive(child, depth - 1)
+    }
+}
+collectInteractive(window, 30)
+
+// ── Content: headings and texts ───────────────────────────────────────────────
+
+var headings: [String] = []
+var texts: [String] = []
+var seenTextKeys = Set<String>()
+
+func collectContent(_ el: AXUIElement, _ depth: Int) {
+    if depth < 0 { return }
+    let role = getRole(el)
+    if role == "AXHeading" || role == "AXStaticText" {
+        if let rect = getRect(el), rect.y >= visibleMinY && rect.y <= visibleMaxY, rect.h > 0 {
+            let lbl = getLabel(el)
+            if !lbl.isEmpty && !seenTextKeys.contains(lbl) {
+                seenTextKeys.insert(lbl)
+                if role == "AXHeading" {
+                    headings.append(lbl)
+                } else if texts.count < 20 {
+                    texts.append(lbl)
+                }
+            }
+        }
+    }
+    for child in getChildren(el) {
+        collectContent(child, depth - 1)
+    }
+}
+collectContent(window, 30)
+
+// Remove texts that duplicate headings
+let headingSet = Set(headings)
+texts = texts.filter { !headingSet.contains($0) }
+if texts.count > 20 { texts = Array(texts.prefix(20)) }
+
+// ── Scroll awareness ──────────────────────────────────────────────────────────
+
+// Use a class (reference type) to accumulate scroll detection results,
+// avoiding Swift exclusivity access violations that occur with inout params in recursion.
+final class ScrollAccum {
+    var vertical: Bool = false
+    var horizontal: Bool = false
+    var aboveFold: [String] = []
+    var belowFold: [String] = []
+    var seen: Set<String> = []
+}
+
+let scrollRolesForLabels: Set<String> = ["AXButton", "AXStaticText", "AXHeading", "AXTextField", "AXLink"]
+
+func isUsefulLabel(_ s: String) -> Bool {
+    guard !s.isEmpty, s.count > 1 else { return false }
+    if s.allSatisfy({ $0.isNumber }) { return false }
+    return true
+}
+
+// Labels belonging to simulator hardware/chrome — never treat as app content.
+let simChromeLbls: Set<String> = ["Action", "Volume Up", "Volume Down", "Sleep/Wake",
+                                   "Side Button", "Home", "Save Screen", "Rotate"]
+
+// Collect above/below fold labels by walking the AX subtree.
+// Only considers elements whose X position is within the iOS screen's horizontal bounds
+// (filters out simulator toolbar/chrome buttons that live outside the screen surface).
+// Elements completely above screenTopMac → aboveFold; completely below screenBottomMac → belowFold.
+func collectFoldLabels(_ el: AXUIElement, _ depth: Int,
+                        _ topMac: Double, _ botMac: Double,
+                        _ acc: ScrollAccum) {
+    if depth < 0 || (acc.aboveFold.count >= 8 && acc.belowFold.count >= 8) { return }
+    let role = getRole(el)
+    if scrollRolesForLabels.contains(role) {
+        let lbl = getLabel(el)
+        if isUsefulLabel(lbl) && !acc.seen.contains(lbl) && !simChromeLbls.contains(lbl) {
+            if let (pos, sz) = screenRect(el) {
+                let elLeft   = Double(pos.x)
+                let elRight  = Double(pos.x + sz.width)
+                let elTop    = Double(pos.y)
+                let elBottom = Double(pos.y + sz.height)
+                let elCenterX = (elLeft + elRight) / 2
+                // Must be horizontally within the iOS screen surface (filters simulator chrome)
+                guard elCenterX >= screenLeft && elCenterX <= screenRightMac else { return }
+                if elBottom < topMac && acc.aboveFold.count < 8 {
+                    acc.seen.insert(lbl); acc.aboveFold.append(lbl)
+                } else if elTop > botMac && acc.belowFold.count < 8 {
+                    acc.seen.insert(lbl); acc.belowFold.append(lbl)
+                }
+            }
+        }
+    }
+    for child in getChildren(el) { collectFoldLabels(child, depth - 1, topMac, botMac, acc) }
+}
+
+// True macOS right/bottom edge of the iOS screen surface.
+// screenW and screenH are already in macOS pts (SIM_SCREEN_W/H), so no zoom multiplication needed.
+let screenRightMac  = originX + screenW   // macOS x of iOS right edge
+let screenBottomMac = originY + screenH   // macOS y of iOS bottom edge
+
+// Roles to skip entirely when detecting overflow (simulator chrome / container elements).
+let overflowSkipRoles: Set<String> = ["AXWindow", "AXToolbar"]
+
+// Detect vertical/horizontal overflow by walking the AX tree.
+// Only counts app-content elements whose horizontal center lies within the iOS screen surface.
+// Skips simulator window/toolbar chrome which spans beyond the iOS screen by design.
+func detectOverflow(_ el: AXUIElement, _ depth: Int, _ acc: ScrollAccum) {
+    if depth < 0 { return }
+    let role = getRole(el)
+    if overflowSkipRoles.contains(role) {
+        for child in getChildren(el) { detectOverflow(child, depth - 1, acc) }
+        return
+    }
+    if let (pos, sz) = screenRect(el) {
+        let elLeft   = Double(pos.x);  let elRight  = Double(pos.x + sz.width)
+        let elTop    = Double(pos.y);  let elBottom = Double(pos.y + sz.height)
+        let elCenterX = (elLeft + elRight) / 2
+        // Only consider elements whose center is horizontally within the iOS screen surface
+        if elCenterX >= screenLeft && elCenterX <= screenRightMac {
+            if elBottom > screenBottomMac + 5 || elTop < screenTop - 5 { acc.vertical = true }
+            if elRight  > screenRightMac  + 5 || elLeft < screenLeft - 5 { acc.horizontal = true }
+        }
+    }
+    for child in getChildren(el) { detectOverflow(child, depth - 1, acc) }
+}
+
+func findScrollAreas(_ el: AXUIElement, _ depth: Int) -> [AXUIElement] {
+    if depth < 0 { return [] }
+    var result: [AXUIElement] = []
+    if getRole(el) == "AXScrollArea" { result.append(el) }
+    for child in getChildren(el) { result += findScrollAreas(child, depth - 1) }
+    return result
+}
+
+let scrollAcc = ScrollAccum()
+let scrollAreas = findScrollAreas(window, 30)
+
+// Process explicit AXScrollArea elements first
+var hadUsableScrollArea = false
+for sa in scrollAreas {
+    guard let (_, saSize) = screenRect(sa) else { continue }
+    // Only consider scroll areas that cover a significant portion of the screen (>25% of height or width)
+    let saCoversHeight = Double(saSize.height) >= screenH * 0.25
+    let saCoversWidth  = Double(saSize.width)  >= screenW * 0.25
+    guard saCoversHeight || saCoversWidth else { continue }
+    hadUsableScrollArea = true
+
+    detectOverflow(sa, 25, scrollAcc)
+    collectFoldLabels(sa, 25, Double(screenTop), screenBottomMac, scrollAcc)
+}
+
+// Fallback: no AXScrollArea found — walk the full window tree for off-screen elements.
+// Many iOS apps expose all content (including off-screen rows) directly in the flat AX tree
+// without wrapping them in an AXScrollArea, so we must check the visible screen bounds directly.
+if !hadUsableScrollArea {
+    detectOverflow(window, 30, scrollAcc)
+    collectFoldLabels(window, 30, Double(screenTop), screenBottomMac, scrollAcc)
+}
+
+// ── JSON assembly ─────────────────────────────────────────────────────────────
+
+func jsonStr(_ s: String) -> String { return "\"" + escJson(s) + "\"" }
+func jsonStrOpt(_ s: String?) -> String { return s != nil ? jsonStr(s!) : "null" }
+func jsonBool(_ b: Bool) -> String { return b ? "true" : "false" }
+func jsonInt(_ i: Int) -> String { return "\(i)" }
+
+var lines: [String] = []
+lines.append("{")
+lines.append("  \"screen\": " + jsonStr(screenTitle) + ",")
+lines.append("  \"modal\": " + jsonBool(isModal) + ",")
+lines.append("  \"navigation\": {")
+lines.append("    \"title\": " + jsonStrOpt(navTitle) + ",")
+
+if let b = backInfo {
+    let backObj = "{\"label\":" + jsonStr(b.label) + ",\"x\":" + jsonInt(b.x) + ",\"y\":" + jsonInt(b.y) + "}"
+    lines.append("    \"back\": " + backObj + ",")
+} else {
+    lines.append("    \"back\": null,")
+}
+
+if tabs.isEmpty {
+    lines.append("    \"tabs\": []")
+} else {
+    lines.append("    \"tabs\": [")
+    for (i, tab) in tabs.enumerated() {
+        let comma = i < tabs.count - 1 ? "," : ""
+        let tabObj = "      {\"label\":" + jsonStr(tab.label) + ",\"x\":" + jsonInt(tab.x) + ",\"y\":" + jsonInt(tab.y) + ",\"selected\":" + jsonBool(tab.selected) + "}" + comma
+        lines.append(tabObj)
+    }
+    lines.append("    ]")
+}
+lines.append("  },")
+
+if interactives.isEmpty {
+    lines.append("  \"interactive\": [],")
+} else {
+    lines.append("  \"interactive\": [")
+    for (i, el) in interactives.enumerated() {
+        let comma = i < interactives.count - 1 ? "," : ""
+        let valStr = el.value != nil ? jsonStr(el.value!) : "null"
+        let elObj = "    {\"role\":" + jsonStr(el.role) + ",\"label\":" + jsonStr(el.label) + ",\"x\":" + jsonInt(el.x) + ",\"y\":" + jsonInt(el.y) + ",\"w\":" + jsonInt(el.w) + ",\"h\":" + jsonInt(el.h) + ",\"value\":" + valStr + ",\"enabled\":" + jsonBool(el.enabled) + "}" + comma
+        lines.append(elObj)
+    }
+    lines.append("  ],")
+}
+
+lines.append("  \"content\": {")
+if headings.isEmpty {
+    lines.append("    \"headings\": [],")
+} else {
+    let hArr = "    \"headings\": [" + headings.map { jsonStr($0) }.joined(separator: ",") + "],"
+    lines.append(hArr)
+}
+if texts.isEmpty {
+    lines.append("    \"texts\": []")
+} else {
+    let tArr = "    \"texts\": [" + texts.map { jsonStr($0) }.joined(separator: ",") + "]"
+    lines.append(tArr)
+}
+lines.append("  },")
+
+// scroll key
+lines.append("  \"scroll\": {")
+lines.append("    \"vertical\": " + jsonBool(scrollAcc.vertical) + ",")
+lines.append("    \"horizontal\": " + jsonBool(scrollAcc.horizontal) + ",")
+let aboveArr = scrollAcc.aboveFold.map { jsonStr($0) }.joined(separator: ",")
+lines.append("    \"above_fold\": [" + aboveArr + "],")
+let belowArr = scrollAcc.belowFold.map { jsonStr($0) }.joined(separator: ",")
+lines.append("    \"below_fold\": [" + belowArr + "]")
+lines.append("  }")
+lines.append("}")
+
+let output = lines.joined(separator: "\n")
+if !outputPath.isEmpty {
+    try? output.write(toFile: outputPath, atomically: true, encoding: .utf8)
+} else {
+    print(output)
+}
+SWIFTEOF
+
+  local swift_exit=$?
+  local result=""
+  if [[ -f "$tmp_out" ]]; then
+    result=$(cat "$tmp_out")
+    rm -f "$tmp_out"
+  fi
+  if [[ $swift_exit -ne 0 ]] || [[ -z "$result" ]]; then
+    rm -f "$tmp_out"
+    die "layout-map: failed to collect AX layout"
+  fi
+
+  # Write raw JSON to a temp file to avoid shell-quoting issues inside the Python script
+  local py_in
+  py_in=$(mktemp /tmp/sim_layout_py_XXXXXX.json)
+  printf '%s' "$result" > "$py_in"
+
+  local enriched
+  enriched=$(python3 - "$py_in" << 'PYEOF'
+import json, sys
+
+input_path = sys.argv[1]
+with open(input_path) as f:
+    raw = f.read()
+
+try:
+    data = json.loads(raw)
+except Exception:
+    print(raw, end="")
+    sys.exit(0)
+
+interactive = data.get("interactive", [])
+navigation  = data.get("navigation", {})
+scroll      = data.get("scroll", {})
+modal       = data.get("modal", False)
+tabs        = navigation.get("tabs", [])
+back        = navigation.get("back")
+nav_title   = navigation.get("title")
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def has_role(role):
+    return any(el.get("role", "") == role for el in interactive)
+
+def has_label_containing(words):
+    for el in interactive:
+        lbl = el.get("label", "").lower()
+        for w in words:
+            if w.lower() in lbl:
+                return True
+    return False
+
+def has_close_button():
+    for el in interactive:
+        lbl = el.get("label", "").lower()
+        if "close" in lbl or "dismiss" in lbl or "cancel" in lbl:
+            return True
+    return False
+
+# ── Context (first match wins) ────────────────────────────────────────────────
+context = "unknown"
+
+has_play_pause = has_label_containing(["play", "pause", "btnplay", "btnpause"])
+has_slider     = has_role("AXSlider")
+has_back       = back is not None
+has_tabs       = len(tabs) >= 1
+
+if has_play_pause or (has_slider and has_back and not has_tabs):
+    context = "media_player"
+elif modal or (not nav_title and has_close_button()):
+    context = "modal_sheet"
+elif has_role("AXSearchField"):
+    context = "search"
+elif has_role("AXTextField") or has_role("AXSecureTextField"):
+    context = "form"
+elif len(tabs) >= 3:
+    context = "tab_screen"
+elif scroll.get("vertical") and len(interactive) > 3:
+    if has_back and not has_tabs:
+        context = "detail_screen"
+    else:
+        context = "list"
+elif has_back and not has_tabs and scroll.get("vertical"):
+    context = "detail_screen"
+
+# ── Suggested actions ─────────────────────────────────────────────────────────
+suggested = []
+
+# 1. Scroll down
+below_fold = scroll.get("below_fold", [])
+if below_fold:
+    labels = ", ".join(below_fold[:4])
+    suggested.append("scroll down to reveal: " + labels)
+
+# 2. Scroll up
+above_fold = scroll.get("above_fold", [])
+if above_fold:
+    labels = ", ".join(above_fold[:4])
+    suggested.append("scroll up to reveal: " + labels)
+
+# 3. Tabs — x/y from Swift are already center coords
+for tab in tabs:
+    if tab.get("selected"):
+        continue
+    lbl = tab.get("label", "")
+    cx  = tab.get("x", 0)
+    cy  = tab.get("y", 0)
+    suggested.append("tap tab '" + lbl + "' at (" + str(cx) + ", " + str(cy) + ")")
+
+# 4. Back button — x/y from Swift are already center coords
+if back:
+    lbl = back.get("label", "Back")
+    cx  = back.get("x", 0)
+    cy  = back.get("y", 0)
+    suggested.append("tap back '" + lbl + "' at (" + str(cx) + ", " + str(cy) + ") to return")
+
+# 5. Interactive elements (up to 6, skip empty label, skip back)
+back_label_lower = back.get("label", "").lower() if back else None
+count = 0
+for el in interactive:
+    if count >= 6:
+        break
+    lbl = el.get("label", "")
+    if not lbl:
+        continue
+    if back_label_lower and lbl.lower() == back_label_lower:
+        continue
+    cx = el.get("x", 0) + el.get("w", 0) // 2
+    cy = el.get("y", 0) + el.get("h", 0) // 2
+    suggested.append("tap '" + lbl + "' at (" + str(cx) + ", " + str(cy) + ")")
+    count += 1
+
+# Cap at 10
+suggested = suggested[:10]
+
+data["context"]           = context
+data["suggested_actions"] = suggested
+
+print(json.dumps(data, indent=2))
+PYEOF
+)
+
+  local py_exit=$?
+  rm -f "$py_in"
+
+  if [[ $py_exit -ne 0 ]] || [[ -z "$enriched" ]]; then
+    # Python failed — fall back to original Swift output unchanged
+    echo "$result"
+  else
+    echo "$enriched"
+  fi
+}
+
+cmd_wait_for() {
+  [[ $# -ge 1 ]] || die "Usage: sim.sh wait-for <label> [timeout_seconds]"
+  local search_label="$1"
+  local timeout="${2:-10}"
+  # Bootstrap to get SIM_NAME for window targeting when multiple simulators are open.
+  _bootstrap
+
+  local out exit_code
+  out=$(swift - "$search_label" "$timeout" "${SIM_NAME} – ${SIM_OS}" "$SIM_SCREEN_X" "$SIM_SCREEN_Y" 2>&1 << 'SWIFTEOF'
+import ApplicationServices
+import AppKit
+import Foundation
+
+let args = CommandLine.arguments
+let searchLabel = args.count > 1 ? args[1] : ""
+let timeoutSec  = Double(args.count > 2 ? args[2] : "10") ?? 10.0
+let deviceName  = args.count > 3 ? args[3] : ""
+let screenX     = Double(args.count > 4 ? args[4] : "0") ?? 0.0
+let screenY     = Double(args.count > 5 ? args[5] : "0") ?? 0.0
+
+guard let simApp = NSWorkspace.shared.runningApplications
+    .first(where: { $0.bundleIdentifier == "com.apple.iphonesimulator" }) else {
+    fputs("ERROR: Simulator not running\n", stderr); exit(1)
+}
+let pid = simApp.processIdentifier
+let axApp = AXUIElementCreateApplication(pid)
+
+func getAttr(_ el: AXUIElement, _ attr: String) -> AnyObject? {
+    var v: CFTypeRef?
+    guard AXUIElementCopyAttributeValue(el, attr as CFString, &v) == .success else { return nil }
+    return v as AnyObject
+}
+func getLabel(_ el: AXUIElement) -> String {
+    for a in ["AXDescription", "AXTitle", "AXLabel", "AXValue"] {
+        if let s = getAttr(el, a) as? String, !s.isEmpty { return s }
+    }
+    return ""
+}
+func treeContains(_ el: AXUIElement, _ label: String, depth: Int = 0) -> Bool {
+    guard depth < 25 else { return false }
+    if getLabel(el).localizedCaseInsensitiveContains(label) { return true }
+    guard let ch = getAttr(el, "AXChildren") as? [AXUIElement] else { return false }
+    return ch.contains { treeContains($0, label, depth: depth + 1) }
+}
+func pickWindow(_ windows: [AXUIElement], screenX: Double, screenY: Double, deviceName: String) -> AXUIElement? {
+    // Primary: find the window whose bounds contain the known screen origin.
+    // SIM_SCREEN_X/Y are the macOS screen coords of the iOS screen surface — unique per window.
+    for win in windows {
+        var posRef: CFTypeRef?
+        var sizeRef: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(win, kAXPositionAttribute as CFString, &posRef) == .success,
+              AXUIElementCopyAttributeValue(win, kAXSizeAttribute as CFString, &sizeRef) == .success,
+              let pv = posRef, let sv = sizeRef else { continue }
+        var pt = CGPoint.zero; var sz = CGSize.zero
+        AXValueGetValue(pv as! AXValue, .cgPoint, &pt)
+        AXValueGetValue(sv as! AXValue, .cgSize, &sz)
+        if screenX >= Double(pt.x) && screenX <= Double(pt.x + sz.width) &&
+           screenY >= Double(pt.y) && screenY <= Double(pt.y + sz.height) {
+            return win
+        }
+    }
+    // Fallback: match by title containing device name
+    for win in windows {
+        var titleRef: CFTypeRef?
+        if AXUIElementCopyAttributeValue(win, kAXTitleAttribute as CFString, &titleRef) == .success,
+           let title = titleRef as? String, title.contains(deviceName) { return win }
+    }
+    return windows.first
+}
+func checkTree() -> Bool {
+    var ref: CFTypeRef?
+    AXUIElementCopyAttributeValue(axApp, "AXWindows" as CFString, &ref)
+    guard let wins = ref as? [AXUIElement],
+          let win = pickWindow(wins, screenX: screenX, screenY: screenY, deviceName: deviceName) else { return false }
+    return treeContains(win, searchLabel)
+}
+
+// Immediate check
+if checkTree() { print("READY: \(searchLabel)"); exit(0) }
+
+// Shared found flag
+final class State { var found = false }
+let state = State()
+
+// AXObserver callback
+let callback: AXObserverCallback = { _, _, _, refcon in
+    let s = Unmanaged<State>.fromOpaque(refcon!).takeUnretainedValue()
+    guard !s.found else { return }
+    if checkTree() {
+        s.found = true
+        print("READY: \(searchLabel)")
+        CFRunLoopStop(CFRunLoopGetCurrent())
+    }
+}
+
+var observer: AXObserver?
+guard AXObserverCreate(pid, callback, &observer) == .success, let obs = observer else {
+    fputs("ERROR: AXObserverCreate failed\n", stderr); exit(1)
+}
+let ctxPtr = Unmanaged.passRetained(state).toOpaque()
+CFRunLoopAddSource(CFRunLoopGetCurrent(), AXObserverGetRunLoopSource(obs), .defaultMode)
+AXObserverAddNotification(obs, axApp, kAXLayoutChangedNotification as CFString, ctxPtr)
+
+// Safety-net polling (1.5s interval) catches async changes between AX notifications
+let pollTimer = DispatchSource.makeTimerSource(queue: .main)
+pollTimer.schedule(deadline: .now() + 1.5, repeating: 1.5)
+pollTimer.setEventHandler {
+    guard !state.found else { pollTimer.cancel(); return }
+    if checkTree() {
+        state.found = true
+        print("READY: \(searchLabel)")
+        CFRunLoopStop(CFRunLoopGetCurrent())
+    }
+}
+pollTimer.resume()
+
+// Timeout
+let timeoutTimer = DispatchSource.makeTimerSource(queue: .main)
+timeoutTimer.schedule(deadline: .now() + timeoutSec)
+timeoutTimer.setEventHandler { CFRunLoopStop(CFRunLoopGetCurrent()) }
+timeoutTimer.resume()
+
+CFRunLoopRun()
+pollTimer.cancel()
+timeoutTimer.cancel()
+
+if state.found { exit(0) }
+fputs("ERROR: wait-for timed out after \(Int(timeoutSec))s waiting for: \(searchLabel)\n", stderr)
+exit(1)
+SWIFTEOF
+  )
+  exit_code=$?
+  if [[ $exit_code -eq 0 ]]; then
+    echo "$out"
+  else
+    die "${out#ERROR: }"
+  fi
+}
+
+cmd_wait_for_stable() {
+  local timeout="${1:-5}"
+  _bootstrap
+
+  local out exit_code
+  out=$(swift - "$timeout" "${SIM_NAME} – ${SIM_OS}" "$SIM_SCREEN_X" "$SIM_SCREEN_Y" 2>&1 << 'SWIFTEOF'
+import ApplicationServices
+import AppKit
+import Foundation
+
+let args = CommandLine.arguments
+let timeoutSec = Double(args.count > 1 ? args[1] : "5") ?? 5.0
+let deviceName = args.count > 2 ? args[2] : ""
+let screenX    = Double(args.count > 3 ? args[3] : "0") ?? 0.0
+let screenY    = Double(args.count > 4 ? args[4] : "0") ?? 0.0
+
+guard let simApp = NSWorkspace.shared.runningApplications
+    .first(where: { $0.bundleIdentifier == "com.apple.iphonesimulator" }) else {
+    fputs("ERROR: Simulator not running\n", stderr); exit(1)
+}
+let pid = simApp.processIdentifier
+let axApp = AXUIElementCreateApplication(pid)
+
+func getAttr(_ el: AXUIElement, _ attr: String) -> AnyObject? {
+    var v: CFTypeRef?
+    guard AXUIElementCopyAttributeValue(el, attr as CFString, &v) == .success else { return nil }
+    return v as AnyObject
+}
+func pickWindow(_ windows: [AXUIElement], screenX: Double, screenY: Double, deviceName: String) -> AXUIElement? {
+    for win in windows {
+        var posRef: CFTypeRef?
+        var sizeRef: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(win, kAXPositionAttribute as CFString, &posRef) == .success,
+              AXUIElementCopyAttributeValue(win, kAXSizeAttribute as CFString, &sizeRef) == .success,
+              let pv = posRef, let sv = sizeRef else { continue }
+        var pt = CGPoint.zero; var sz = CGSize.zero
+        AXValueGetValue(pv as! AXValue, .cgPoint, &pt)
+        AXValueGetValue(sv as! AXValue, .cgSize, &sz)
+        if screenX >= Double(pt.x) && screenX <= Double(pt.x + sz.width) &&
+           screenY >= Double(pt.y) && screenY <= Double(pt.y + sz.height) { return win }
+    }
+    for win in windows {
+        var titleRef: CFTypeRef?
+        if AXUIElementCopyAttributeValue(win, kAXTitleAttribute as CFString, &titleRef) == .success,
+           let title = titleRef as? String, title.contains(deviceName) { return win }
+    }
+    return windows.first
+}
+func snapshot(_ el: AXUIElement, _ depth: Int) -> String {
+    guard depth >= 0 else { return "" }
+    var parts: [String] = []
+    for attr in ["AXRole", "AXLabel", "AXTitle", "AXDescription", "AXValue"] {
+        if let v = getAttr(el, attr) as? String, !v.isEmpty { parts.append("\(attr)=\(v)") }
+    }
+    if let posVal = getAttr(el, kAXPositionAttribute),
+       let sizeVal = getAttr(el, kAXSizeAttribute) {
+        var pt = CGPoint.zero; var sz = CGSize.zero
+        AXValueGetValue(posVal as! AXValue, .cgPoint, &pt)
+        AXValueGetValue(sizeVal as! AXValue, .cgSize, &sz)
+        parts.append("pos=\(Int(pt.x)),\(Int(pt.y))|sz=\(Int(sz.width)),\(Int(sz.height))")
+    }
+    guard let children = getAttr(el, "AXChildren") as? [AXUIElement] else { return parts.joined(separator: "|") }
+    let childSnaps = children.map { snapshot($0, depth - 1) }.joined(separator: ";")
+    return parts.joined(separator: "|") + "{" + childSnaps + "}"
+}
+func takeSnapshot() -> String {
+    var ref: CFTypeRef?
+    AXUIElementCopyAttributeValue(axApp, "AXWindows" as CFString, &ref)
+    guard let wins = ref as? [AXUIElement],
+          let win = pickWindow(wins, screenX: screenX, screenY: screenY, deviceName: deviceName) else { return "" }
+    return snapshot(win, 25)
+}
+
+let deadline = Date().addingTimeInterval(timeoutSec)
+var prev = takeSnapshot()
+repeat {
+    Thread.sleep(forTimeInterval: 0.2)
+    let curr = takeSnapshot()
+    if curr == prev && !curr.isEmpty { print("STABLE"); exit(0) }
+    prev = curr
+} while Date() < deadline
+fputs("ERROR: wait-for-stable timed out after \(Int(timeoutSec))s\n", stderr)
+exit(1)
+SWIFTEOF
+  )
+  exit_code=$?
+  if [[ $exit_code -eq 0 ]]; then
+    echo "$out"
+  else
+    die "${out#ERROR: }"
+  fi
+}
+
+cmd_type() {
+  [[ $# -ge 1 ]] || die "Usage: sim.sh type <text>"
+  local text="$1"
+  _bootstrap
+
+  # Prefer WDA setValue (goes through proper iOS input path, handles Unicode/spaces correctly).
+  # Falls back to AX direct-value setting if WDA is not running or has no active element.
+  if _wda_type "$text"; then
+    echo "Typed (WDA): $text"
+    return 0
+  fi
+
+  # WDA not available or no active element — fall back to AX API
+  _type_cgevent "$text"
+  echo "Typed: $text"
+}
+
+cmd_setup() {
+  # Parse arguments: <app_path_or_bundle_id> [--port <wda_port>]
+  local app_arg=""
+  local wda_port="8100"
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --port)
+        [[ $# -ge 2 ]] || die "setup: --port requires a value"
+        wda_port="$2"
+        shift 2
+        ;;
+      *)
+        [[ -z "$app_arg" ]] || die "setup: unexpected argument: $1"
+        app_arg="$1"
+        shift
+        ;;
+    esac
+  done
+
+  [[ -n "$app_arg" ]] || die "Usage: sim.sh [--device <UDID>] setup <app_path_or_bundle_id> [--port <wda_port>]"
+
+  # ── Step 1: Detect / boot simulator ─────────────────────────────────────────
+
+  echo "==> [1/5] Detecting simulator..."
+
+  # If a specific UDID was given, verify it exists and boot it if needed.
+  if [[ -n "$SIM_TARGET_UDID" ]]; then
+    local sim_state
+    sim_state=$(xcrun simctl list devices --json 2>/dev/null \
+      | jq -r --arg udid "$SIM_TARGET_UDID" '
+          .devices | to_entries[] | .value[] | select(.udid == $udid) | .state
+        ' 2>/dev/null | head -1) || true
+
+    [[ -n "$sim_state" ]] \
+      || die "setup: no simulator found with UDID: $SIM_TARGET_UDID"
+
+    if [[ "$sim_state" != "Booted" ]]; then
+      echo "    Booting simulator $SIM_TARGET_UDID..."
+      xcrun simctl boot "$SIM_TARGET_UDID" 2>/dev/null || true
+    else
+      echo "    Simulator $SIM_TARGET_UDID already booted."
+    fi
+
+    echo "    Waiting for simulator to fully boot..."
+    xcrun simctl bootstatus "$SIM_TARGET_UDID" -b \
+      || die "setup: simulator failed to reach booted state"
+  fi
+
+  # Open Simulator.app if not already visible.
+  if ! pgrep -x Simulator > /dev/null 2>&1; then
+    echo "    Opening Simulator.app..."
+    open -a Simulator
+    # Give Simulator.app a moment to render its window so AppleScript can see it.
+    sleep 2
+  else
+    echo "    Simulator.app is already running."
+  fi
+
+  # Run _bootstrap to populate all SIM_* globals (uses detect_device if no --device was given).
+  _bootstrap
+  echo "    Target: $SIM_NAME ($SIM_OS) — UDID: $SIM_UDID"
+
+  # ── Step 2: Build WDA if not already built ──────────────────────────────────
+
+  echo "==> [2/5] Checking WDA build..."
+
+  local wda_source="/tmp/WebDriverAgent"
+  local wda_runner="/tmp/WDA_DerivedData/Build/Products/Debug-iphonesimulator/WebDriverAgentRunner-Runner.app"
+
+  if [[ ! -d "$wda_source" ]]; then
+    echo ""
+    echo "Error: WebDriverAgent not found at $wda_source"
+    echo "Clone it first: git clone https://github.com/appium/WebDriverAgent $wda_source"
+    exit 1
+  fi
+
+  if [[ -d "$wda_runner" ]]; then
+    echo "    WDA already built at $wda_runner — skipping build."
+  else
+    echo "    Building WDA (this may take a few minutes)..."
+    xcodebuild build-for-testing \
+      -project "$wda_source/WebDriverAgent.xcodeproj" \
+      -scheme WebDriverAgentRunner \
+      -destination "platform=iOS Simulator,id=${SIM_UDID}" \
+      -derivedDataPath /tmp/WDA_DerivedData \
+      CODE_SIGNING_ALLOWED=NO 2>&1 | tail -5
+    [[ -d "$wda_runner" ]] \
+      || die "setup: WDA build completed but runner app not found at $wda_runner"
+    echo "    WDA build complete."
+  fi
+
+  # ── Step 3: Install app (if a .app path was given) ──────────────────────────
+
+  echo "==> [3/5] Installing app..."
+
+  local bundle_id=""
+  if [[ "$app_arg" == *.app ]]; then
+    echo "    Installing $app_arg on $SIM_UDID..."
+    xcrun simctl install "$SIM_UDID" "$app_arg" \
+      || die "setup: xcrun simctl install failed for $app_arg"
+    echo "    App installed."
+
+    # Derive bundle ID from the installed .app's Info.plist.
+    local info_plist="$app_arg/Info.plist"
+    [[ -f "$info_plist" ]] \
+      || die "setup: Info.plist not found in $app_arg"
+    bundle_id=$(plutil -extract CFBundleIdentifier raw "$info_plist" 2>/dev/null) \
+      || die "setup: could not read CFBundleIdentifier from $info_plist"
+    echo "    Bundle ID: $bundle_id"
+  else
+    bundle_id="$app_arg"
+    echo "    Bundle ID provided directly ($bundle_id) — skipping install."
+  fi
+
+  # ── Step 4: Start WDA ────────────────────────────────────────────────────────
+
+  echo "==> [4/5] Starting WDA on port $wda_port..."
+  cmd_wda_start "$wda_port"
+
+  # ── Step 5: Launch app ───────────────────────────────────────────────────────
+
+  echo "==> [5/5] Launching $bundle_id..."
+  xcrun simctl launch "$SIM_UDID" "$bundle_id" \
+    || die "setup: xcrun simctl launch failed for bundle ID: $bundle_id"
+  echo "    App launched."
+
+  # ── Final status ─────────────────────────────────────────────────────────────
+
+  echo ""
+  echo "── Setup complete ───────────────────────────────────────────────────────────"
+  echo "  Simulator:  $SIM_NAME ($SIM_OS)"
+  echo "  UDID:       $SIM_UDID"
+  echo "  WDA port:   $WDA_PORT"
+  echo "  WDA session: $WDA_SESSION"
+  echo "  App:        $bundle_id"
+  echo ""
+  echo "WDA is ready. You can now use tap/swipe/scroll commands."
+}
+
+cmd_screenshot() {
+  [[ $# -ge 1 ]] || die "Usage: sim.sh screenshot <output.png>"
+  local outdir
+  outdir=$(dirname "$1")
+  [[ -d "$outdir" ]] || die "Output directory does not exist: $outdir"
+  detect_device
+  xcrun simctl io "$SIM_UDID" screenshot "$1" \
+    || die "simctl screenshot failed for UDID $SIM_UDID — path: $1"
+  echo "Screenshot saved: $1"
+}
+
+# ── Main Dispatch ─────────────────────────────────────────────────────────────
+
+# Accept UDID env var as a shorthand for --device (e.g. UDID=<udid> bash sim.sh <cmd>)
+[[ -z "$SIM_TARGET_UDID" && -n "${UDID:-}" ]] && SIM_TARGET_UDID="$UDID"
+
+# Parse optional --device flag (in any order) before the command name
+while true; do
+  case "${1:-}" in
+    --device)
+      [[ $# -ge 2 ]] || die "Usage: sim.sh --device <UDID> <command> [args]"
+      SIM_TARGET_UDID="$2"
+      shift 2
+      ;;
+    *) break ;;
+  esac
+done
+
+CMD="${1:-}"
+shift || true  # 'shift' exits non-zero on empty args under set -e; || true guards this
+
+case "$CMD" in
+  status)       cmd_status                ;;
+  setup)        cmd_setup        "$@"    ;;
+  wda-start)    cmd_wda_start    "$@"    ;;
+  tap)          cmd_tap         "$@"      ;;
+  swipe)        cmd_swipe       "$@"      ;;
+  scroll-up)    cmd_scroll_up   "$@"      ;;
+  scroll-down)  cmd_scroll_down "$@"      ;;
+  scroll-to-visible) cmd_scroll_to_visible "$@"  ;;
+  screenshot)   cmd_screenshot  "$@"      ;;
+  describe)     cmd_describe    "$@"      ;;
+  tap-element)  cmd_tap_element "$@"      ;;
+  tap-and-wait) cmd_tap_and_wait "$@"    ;;
+  type)         cmd_type        "$@"      ;;
+  screen-title) cmd_screen_title "$@"    ;;
+  find-element) cmd_find_element "$@"    ;;
+  wait-for)        cmd_wait_for       "$@"  ;;
+  wait-for-stable) cmd_wait_for_stable "$@" ;;
+  describe-point)  cmd_describe_point "$@"  ;;
+  layout-map)      cmd_layout_map           ;;
+  ""|--help|-h) usage; exit 0           ;;
+  *) die "Unknown command: $CMD. Run sim.sh --help for usage." ;;
+esac
