@@ -1,9 +1,9 @@
 class Sim < Formula
   desc "iOS Simulator interaction CLI for developers and AI agents"
-  homepage "https://github.com/mindvalley/homebrew-sim"
+  homepage "https://github.com/mindvalley/simclaw"
   # Update url and sha256 after pushing the first GitHub release tag.
   # To generate sha256: curl -sL <tarball_url> | sha256sum
-  url "https://github.com/mindvalley/homebrew-sim/archive/refs/tags/v1.0.0.tar.gz"
+  url "https://github.com/mindvalley/simclaw/archive/refs/tags/v1.0.0.tar.gz"
   sha256 "PLACEHOLDER_UPDATE_AFTER_FIRST_RELEASE"
   license "MIT"
   version "1.0.0"
@@ -28,7 +28,7 @@ class Sim < Formula
 
         sim --device <UDID> setup <bundle_id_or_app_path>
 
-      Full docs: https://github.com/mindvalley/homebrew-sim
+      Full docs: https://github.com/mindvalley/simclaw
     EOS
   end
 
