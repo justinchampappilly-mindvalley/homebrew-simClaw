@@ -25,7 +25,7 @@ Touch injection uses [WebDriverAgent](https://github.com/appium/WebDriverAgent) 
 
 ```bash
 brew tap mindvalley/sim
-brew install sim
+brew install simclaw
 ```
 
 ### curl (no Homebrew)

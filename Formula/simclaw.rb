@@ -1,4 +1,4 @@
-class Sim < Formula
+class Simclaw < Formula
   desc "iOS Simulator interaction CLI for developers and AI agents"
   homepage "https://github.com/mindvalley/homebrew-sim"
   # Update url and sha256 after pushing the first GitHub release tag.
