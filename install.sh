@@ -2,7 +2,7 @@
 # install.sh — curl-based installer for sim (fallback if Homebrew is not available)
 #
 # Usage:
-#   curl -fsSL https://raw.githubusercontent.com/mindvalley/simclaw/main/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/mindvalley/homebrew-sim/main/install.sh | bash
 #
 # What it does:
 #   1. Installs jq if missing (requires Homebrew)
@@ -11,7 +11,7 @@
 
 set -euo pipefail
 
-REPO="https://raw.githubusercontent.com/mindvalley/simclaw/main"
+REPO="https://raw.githubusercontent.com/mindvalley/homebrew-sim/main"
 SCRIPT_NAME="sim"
 
 # Determine install directory
@@ -53,4 +53,4 @@ echo "       sim --device <UDID> setup <bundle_id>"
 echo "  3. Navigate:"
 echo "       sim --device <UDID> layout-map"
 echo ""
-echo "See https://github.com/mindvalley/simclaw for full documentation."
+echo "See https://github.com/mindvalley/homebrew-sim for full documentation."
