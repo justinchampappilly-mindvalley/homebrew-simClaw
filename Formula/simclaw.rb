@@ -8,6 +8,11 @@ class Simclaw < Formula
   license "MIT"
   version "1.0.0"
 
+  # For local testing before GitHub release exists:
+  #   brew tap mindvalley/sim /Users/justin/homebrew-sim
+  #   brew install --HEAD mindvalley/sim/simclaw
+  head "file:///Users/justin/homebrew-sim", using: :git
+
   # Runtime dependencies
   depends_on "jq"
   # swift and xcrun come from Xcode — not installable via Homebrew, documented in README
