@@ -24,14 +24,14 @@ Touch injection uses [WebDriverAgent](https://github.com/appium/WebDriverAgent) 
 ### Homebrew (recommended)
 
 ```bash
-brew tap mindvalley/simClaw
+brew tap justinchampappilly-mindvalley/simClaw
 brew install simclaw
 ```
 
 ### curl (no Homebrew)
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/mindvalley/homebrew-simClaw/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/justinchampappilly-mindvalley/homebrew-simClaw/main/install.sh | bash
 ```
 
 ---

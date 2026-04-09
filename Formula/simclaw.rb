@@ -1,17 +1,10 @@
 class Simclaw < Formula
   desc "iOS Simulator interaction CLI for developers and AI agents"
-  homepage "https://github.com/mindvalley/homebrew-simClaw"
-  # Update url and sha256 after pushing the first GitHub release tag.
-  # To generate sha256: curl -sL <tarball_url> | sha256sum
-  url "https://github.com/mindvalley/homebrew-simClaw/archive/refs/tags/v1.0.0.tar.gz"
-  sha256 "PLACEHOLDER_UPDATE_AFTER_FIRST_RELEASE"
+  homepage "https://github.com/justinchampappilly-mindvalley/homebrew-simClaw"
+  url "https://github.com/justinchampappilly-mindvalley/homebrew-simClaw/archive/refs/tags/v1.0.0.tar.gz"
+  sha256 "60bed1b13cf582f2c00be011f130e92549e5b6702e6a27ba7b54bf344a5dcd25"
   license "MIT"
   version "1.0.0"
-
-  # For local testing before GitHub release exists:
-  #   brew tap mindvalley/sim /Users/justin/homebrew-simClaw
-  #   brew install --HEAD mindvalley/sim/simclaw
-  head "file:///Users/justin/homebrew-simClaw", using: :git
 
   # Runtime dependencies
   depends_on "jq"
@@ -57,7 +50,7 @@ class Simclaw < Formula
 
       They are available immediately in any Claude Code session.
 
-      Full docs: https://github.com/mindvalley/homebrew-simClaw
+      Full docs: https://github.com/justinchampappilly-mindvalley/homebrew-simClaw
     EOS
   end
 
