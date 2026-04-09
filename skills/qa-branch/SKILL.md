@@ -123,8 +123,9 @@ xcodebuild -resolvePackageDependencies \
 
 If resolve fails with "already exists in file system":
 ```bash
+DERIVED_DATA=$(find ~/Library/Developer/Xcode/DerivedData -maxdepth 1 -name "Mindvalley-*" -type d | head -1)
 rm -rf ~/Library/Caches/org.swift.swiftpm/
-rm -rf ~/Library/Developer/Xcode/DerivedData/Mindvalley-doihergfhdolpxftumgtbjzmcovj/SourcePackages/
+rm -rf "$DERIVED_DATA/SourcePackages/"
 xcodebuild -resolvePackageDependencies -project Mindvalley.xcodeproj -scheme "Mindvalley" 2>&1 | tail -5
 ```
 
@@ -139,7 +140,7 @@ xcodebuild build \
 
 **If build fails:**
 - Check error output for missing symbols or framework errors
-- If module cache issue: `rm -rf ~/Library/Developer/Xcode/DerivedData/Mindvalley-doihergfhdolpxftumgtbjzmcovj/Build/Intermediates.noindex/SwiftExplicitPrecompiledModules/ ~/Library/Developer/Xcode/ModuleCache.noindex/` then retry build once
+- If module cache issue: run `DERIVED_DATA=$(find ~/Library/Developer/Xcode/DerivedData -maxdepth 1 -name "Mindvalley-*" -type d | head -1) && rm -rf "$DERIVED_DATA/Build/Intermediates.noindex/SwiftExplicitPrecompiledModules/" ~/Library/Developer/Xcode/ModuleCache.noindex/` then retry build once
 - Stop and report to the user if build still fails after retry; do NOT proceed to testing
 
 Report build status:
@@ -166,7 +167,7 @@ Wait 3 seconds after booting.
 
 ### 3b. Install app on all simulators
 ```bash
-APP_PATH="$HOME/Library/Developer/Xcode/DerivedData/Mindvalley-doihergfhdolpxftumgtbjzmcovj/Build/Products/Debug-iphonesimulator/Mindvalley.app"
+APP_PATH=$(find ~/Library/Developer/Xcode/DerivedData -maxdepth 4 -name "Mindvalley.app" -path "*/Debug-iphonesimulator/*" | head -1)
 
 # iPhone
 xcrun simctl install <IPHONE_UDID> "$APP_PATH"
@@ -367,7 +368,7 @@ osascript -e 'display notification "QA complete — comment posted to PR #<N>" w
 - **App bundle ID:** `com.mindvalley.mvacademy`
 - **Primary iPhone 16 UDID:** `A0F9CB4E-ECF0-461B-A80E-C20810D732EA`
 - **Build flag:** use `-project Mindvalley.xcodeproj` NOT `-workspace`
-- **DerivedData:** `~/Library/Developer/Xcode/DerivedData/Mindvalley-doihergfhdolpxftumgtbjzmcovj/`
+- **DerivedData:** `$(find ~/Library/Developer/Xcode/DerivedData -maxdepth 1 -name "Mindvalley-*" -type d | head -1)` (hash suffix is machine-specific)
 - **sim:** `sim` (installed via `brew install simclaw`)
 - **Upload script:** `python3 Scripts/github_upload_image.py --resize 390`
 - **WDA port convention:** iPhone=8100, iPad=8101, second iPhone=8102
