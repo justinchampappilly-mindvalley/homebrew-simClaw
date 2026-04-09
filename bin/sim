@@ -1078,11 +1078,23 @@ cmd_wda_start() {
 
   echo "Starting WDA for UDID=${SIM_UDID} on port ${port}..."
 
+  # The xctestrun EnvironmentVariables block contains USE_PORT="" baked in at build time.
+  # That empty-string entry overrides any host-level `env USE_PORT=N` prefix, causing WDA
+  # to always fall back to its hardcoded default port (8100). Fix: patch a temp copy of the
+  # xctestrun with the correct USE_PORT value before launching, so xcodebuild reads it.
+  local patched_xctestrun
+  local wda_products_dir
+  wda_products_dir=$(dirname "$wda_xctestrun")
+  patched_xctestrun="${wda_products_dir}/wda_patched_${port}.xctestrun"
+  cp "$wda_xctestrun" "$patched_xctestrun"
+  /usr/libexec/PlistBuddy -c \
+    "Set :WebDriverAgentRunner:EnvironmentVariables:USE_PORT $port" \
+    "$patched_xctestrun" 2>/dev/null || true
+
   # Launch WDA in the background using xcodebuild test-without-building.
-  # USE_PORT is picked up by the WDA XCTest runner to bind its HTTP server.
   local wda_log="/tmp/wda_${SIM_UDID}.log"
-  env USE_PORT="$port" xcodebuild test-without-building \
-    -xctestrun "$wda_xctestrun" \
+  xcodebuild test-without-building \
+    -xctestrun "$patched_xctestrun" \
     -destination "id=${SIM_UDID}" \
     > "$wda_log" 2>&1 &
   local wda_pid=$!
@@ -1974,11 +1986,57 @@ cmd_layout_map() {
   _bootstrap
 
   # ── Fetch WDA source XML ──────────────────────────────────────────────────────
-  local wda_xml
-  wda_xml=$(curl -sf --max-time 10 "http://localhost:${WDA_PORT}/session/${WDA_SESSION}/source" 2>/dev/null)
-  if [[ -z "$wda_xml" ]]; then
-    echo '{"error":"WDA unavailable"}' >&2
-    return 1
+  local wda_xml curl_rc
+  wda_xml=$(curl -sf --max-time 8 "http://localhost:${WDA_PORT}/session/${WDA_SESSION}/source" 2>/dev/null); curl_rc=$?; true
+
+  if [[ $curl_rc -eq 28 ]]; then
+    # Timeout (exit code 28): WDA is alive but the AX tree is too large to serialize.
+    # Do NOT retry /source — that would hang again. Return a minimal partial layout-map.
+    echo "WARNING: WDA /source timed out (AX tree too large). Returning partial layout-map." >&2
+
+    # Try to get the active (focused) element label — this call is fast (~1s).
+    local active_label
+    active_label=$(curl -sf --max-time 3 \
+      "http://localhost:${WDA_PORT}/session/${WDA_SESSION}/element/active" 2>/dev/null \
+      | python3 -c \
+        "import sys,json; d=json.load(sys.stdin); v=d.get('value',{}); print(v.get('label') or v.get('name') or '')" \
+        2>/dev/null) || true
+    active_label="${active_label:-unknown}"
+
+    local lw lh
+    lw="${SIM_LOGICAL_W:-393}"
+    lh="${SIM_LOGICAL_H:-852}"
+
+    printf '{"screen":{"w":%s,"h":%s},"navigation":{"title":"%s","tabs":[],"back":null},"interactive":[],"text":[],"scroll":{"vertical":false,"horizontal":false,"above_fold":[],"below_fold":[]},"context":"unknown","suggested_actions":[],"_warning":"WDA /source timed out (AX tree too large). Layout data is partial \u2014 use tap by coordinate or tap-element with known labels."}\n' \
+      "$lw" "$lh" "$active_label"
+    return 0
+  fi
+
+  if [[ $curl_rc -ne 0 ]] || [[ -z "$wda_xml" ]]; then
+    # Non-timeout error: session may have expired — if WDA server is still up, create a new session and retry.
+    local wda_status
+    wda_status=$(curl -s -o /dev/null -w "%{http_code}" --max-time 3 \
+      "http://localhost:${WDA_PORT}/status" 2>/dev/null) || true
+    if [[ "$wda_status" == "200" ]]; then
+      local session_resp session_id
+      session_resp=$(curl -s -X POST \
+        -H 'Content-Type: application/json' \
+        -d '{"capabilities":{"alwaysMatch":{"platformName":"iOS"}}}' \
+        --max-time 15 \
+        "http://localhost:${WDA_PORT}/session" 2>/dev/null) || true
+      session_id=$(echo "$session_resp" | python3 -c \
+        "import sys,json; d=json.load(sys.stdin); print(d.get('sessionId') or d.get('value',{}).get('sessionId',''))" \
+        2>/dev/null) || true
+      if [[ -n "$session_id" ]]; then
+        WDA_SESSION="$session_id"
+        _wda_write_cache
+        wda_xml=$(curl -sf --max-time 8 "http://localhost:${WDA_PORT}/session/${WDA_SESSION}/source" 2>/dev/null) || true
+      fi
+    fi
+    if [[ -z "$wda_xml" ]]; then
+      echo '{"error":"WDA unavailable"}' >&2
+      return 1
+    fi
   fi
 
   # ── Parse XML with Python, produce intermediate JSON ─────────────────────────
