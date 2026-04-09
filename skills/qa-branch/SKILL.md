@@ -25,61 +25,65 @@ Wait for the answer. Store as `IPAD_NEEDED` (`true`/`false`). Then proceed auton
 
 Run all of the following in parallel to maximize speed:
 
-### 1a. Fetch PR metadata
+### 1a. Discover repo and fetch PR metadata
 ```bash
-gh pr view <PR_NUMBER> --repo mindvalley/Mobile_iOS_Mindvalley \
+REPO=$(gh repo view --json nameWithOwner --jq '.nameWithOwner')
+gh pr view <PR_NUMBER> --repo "$REPO" \
   --json title,body,headRefName,baseRefName,state
 ```
 
 Extract:
 - `BRANCH_NAME` — the head branch
+- `BASE_BRANCH` — the base branch (used for cleanup in Phase 7)
 - `PR_TITLE` — for the comment header
-- `PR_BODY` — scan for Expected Behaviour items (EB1, EB2, ...) and "How to Test" steps
+- `PR_BODY` — scan for acceptance criteria items and "How to Test" steps
 
 ### 1b. Fetch PR diff and changed files
 ```bash
-gh pr diff <PR_NUMBER> --repo mindvalley/Mobile_iOS_Mindvalley | head -2000
-gh pr view <PR_NUMBER> --repo mindvalley/Mobile_iOS_Mindvalley --json files \
+gh pr diff <PR_NUMBER> --repo "$REPO" | head -2000
+gh pr view <PR_NUMBER> --repo "$REPO" --json files \
   --jq '.files[].path'
 ```
 
 ### 1c. Discover available simulators
 ```bash
-xcrun simctl list devices available | grep -E "iPhone 16 \(" | head -5
+xcrun simctl list devices available | grep -E "iPhone [0-9]+ \(" | head -5
 xcrun simctl list devices available | grep -E "iPad" | head -5
 ```
 
 Store:
-- `IPHONE_UDID` — prefer `A0F9CB4E-ECF0-461B-A80E-C20810D732EA` (primary iPhone 16). Confirm it appears in the list; if not, pick the first available iPhone 16.
+- `IPHONE_UDID` — first available booted or available iPhone from the list
 - `IPAD_UDID` — first available iPad from the list (only needed if `IPAD_NEEDED=true`)
 
-### 1d. Scenario derivation (do this yourself — no agent needed)
+### 1d. Discover project build settings
+```bash
+XCODEPROJ=$(find . -maxdepth 2 -name "*.xcodeproj" | head -1)
+SCHEME=$(basename "$XCODEPROJ" .xcodeproj)
+APP_NAME="$SCHEME"
+```
+
+### 1e. Scenario derivation (do this yourself — no agent needed)
 
 From the PR description and diff, identify:
 
-1. **Changed UI surfaces** — which screens/tabs are affected? Look for file paths under:
-   - `Mindvalley/Modules/` → legacy UIKit module name
-   - `Mindvalley/NextGen/Screens/` → SwiftUI screen name
-   - `Mindvalley/NextGen/EveAI/` → Eve AI chat
-   - `Mindvalley/NextGen/Components/` → shared components (many screens)
+1. **Changed UI surfaces** — which screens/tabs are affected? Read the changed file paths from the diff and map them to feature names (e.g. files under `*/Screens/Login/` → Login screen, `*/Components/` → shared components that affect many screens).
 
 2. **Changed libraries** — infer test focus from dependency upgrades:
-   - **Nuke** → image loading on all image-heavy screens (feeds, quest covers, profiles, thumbnails)
-   - **Parchment** → paged/tabbed views (Programs tab segments, Meditations segments)
-   - **Lottie** → animated views, especially tab bar icons and loading indicators
-   - **SDWebImage / Kingfisher** → same as Nuke
-   - **Apollo** → GraphQL-driven screens (any feed or data-fetching view)
+   - **Nuke / SDWebImage / Kingfisher** → image loading on all image-heavy screens (feeds, lists, detail views, thumbnails)
+   - **Parchment / TabMan** → paged/tabbed views and segment controls
+   - **Lottie** → animated views, tab bar icons, loading indicators
+   - **Apollo / GraphQL** → any screen that fetches data from the API
 
-3. **Expected Behaviour items** — each `EB{N}` item from the PR description becomes a test scenario
+3. **Acceptance criteria** — each numbered criterion from the PR description becomes a test scenario
 
 4. **How to Test steps** — use these as navigation instructions where possible
 
 Build `TEST_SCENARIOS`: an ordered list, e.g.:
 ```
-1. [Nuke] Image loading — Today feed, Programs list, quest cover art
-2. [Parchment] Paged view tabs — Programs: Discover → Masteries → Courses
-3. [Lottie] Tab bar animations — switch across all 5 tabs
-4. [EB3] Acceptance: <exact EB text>
+1. [Image loading] Verify images load correctly on the main feed and detail screens
+2. [Paged views] Tap each segment in the tabbed view and verify content loads
+3. [Lottie] Switch across all tab bar tabs and verify icons render
+4. [AC1] <exact acceptance criterion text>
 ```
 
 **Parallel simulator assessment:** Since each simulator is fully independent and WDA handles tap routing by UDID, ALL scenarios can run on separate simulators simultaneously if hardware allows. Decide the split:
@@ -89,7 +93,7 @@ Build `TEST_SCENARIOS`: an ordered list, e.g.:
 Print a plan summary before proceeding:
 ```
 ╔══════════════════════════════════════════════════════╗
-║  pr-qa-test — PR #<N>: <title>                       ║
+║  qa-branch — PR #<N>: <title>                        ║
 ║  Branch: <branch>                                    ║
 ║  Scenarios: <X>  |  Simulators: <iphone> [+ ipad]   ║
 ╚══════════════════════════════════════════════════════╝
@@ -117,30 +121,30 @@ ssh-add --apple-use-keychain ~/.ssh/id_ed25519
 ### 2c. Resolve packages
 ```bash
 xcodebuild -resolvePackageDependencies \
-  -project Mindvalley.xcodeproj \
-  -scheme "Mindvalley" 2>&1 | tail -5
+  -project "$XCODEPROJ" \
+  -scheme "$SCHEME" 2>&1 | tail -5
 ```
 
 If resolve fails with "already exists in file system":
 ```bash
-DERIVED_DATA=$(find ~/Library/Developer/Xcode/DerivedData -maxdepth 1 -name "Mindvalley-*" -type d | head -1)
+DERIVED_DATA=$(find ~/Library/Developer/Xcode/DerivedData -maxdepth 1 -name "${SCHEME}-*" -type d | head -1)
 rm -rf ~/Library/Caches/org.swift.swiftpm/
 rm -rf "$DERIVED_DATA/SourcePackages/"
-xcodebuild -resolvePackageDependencies -project Mindvalley.xcodeproj -scheme "Mindvalley" 2>&1 | tail -5
+xcodebuild -resolvePackageDependencies -project "$XCODEPROJ" -scheme "$SCHEME" 2>&1 | tail -5
 ```
 
 ### 2d. Build
 ```bash
 xcodebuild build \
-  -project Mindvalley.xcodeproj \
-  -scheme "Mindvalley" \
+  -project "$XCODEPROJ" \
+  -scheme "$SCHEME" \
   -destination "platform=iOS Simulator,id=<IPHONE_UDID>" \
   2>&1 | grep -E "error:|warning:|BUILD SUCCEEDED|BUILD FAILED" | tail -20
 ```
 
 **If build fails:**
 - Check error output for missing symbols or framework errors
-- If module cache issue: run `DERIVED_DATA=$(find ~/Library/Developer/Xcode/DerivedData -maxdepth 1 -name "Mindvalley-*" -type d | head -1) && rm -rf "$DERIVED_DATA/Build/Intermediates.noindex/SwiftExplicitPrecompiledModules/" ~/Library/Developer/Xcode/ModuleCache.noindex/` then retry build once
+- If module cache issue: run `DERIVED_DATA=$(find ~/Library/Developer/Xcode/DerivedData -maxdepth 1 -name "${SCHEME}-*" -type d | head -1) && rm -rf "$DERIVED_DATA/Build/Intermediates.noindex/SwiftExplicitPrecompiledModules/" ~/Library/Developer/Xcode/ModuleCache.noindex/` then retry build once
 - Stop and report to the user if build still fails after retry; do NOT proceed to testing
 
 Report build status:
@@ -167,15 +171,16 @@ Wait 3 seconds after booting.
 
 ### 3b. Install app on all simulators
 ```bash
-APP_PATH=$(find ~/Library/Developer/Xcode/DerivedData -maxdepth 4 -name "Mindvalley.app" -path "*/Debug-iphonesimulator/*" | head -1)
+APP_PATH=$(find ~/Library/Developer/Xcode/DerivedData -maxdepth 4 -name "${APP_NAME}.app" -path "*/Debug-iphonesimulator/*" | head -1)
+BUNDLE_ID=$(defaults read "$APP_PATH/Info.plist" CFBundleIdentifier)
 
 # iPhone
 xcrun simctl install <IPHONE_UDID> "$APP_PATH"
-xcrun simctl launch <IPHONE_UDID> com.mindvalley.mvacademy
+xcrun simctl launch <IPHONE_UDID> "$BUNDLE_ID"
 
-# iPad (if IPAD_NEEDED) — note: same app binary works for both
+# iPad (if IPAD_NEEDED) — same app binary works for both
 xcrun simctl install <IPAD_UDID> "$APP_PATH"
-xcrun simctl launch <IPAD_UDID> com.mindvalley.mvacademy
+xcrun simctl launch <IPAD_UDID> "$BUNDLE_ID"
 ```
 
 ### 3c. Start WDA on each simulator
@@ -183,12 +188,10 @@ WDA must be started before any tap/swipe commands. Each simulator needs its own 
 
 ```bash
 # iPhone — port 8100
-sim \
-  --device <IPHONE_UDID> wda-start 8100
+sim --device <IPHONE_UDID> wda-start 8100
 
 # iPad — port 8101 (if IPAD_NEEDED)
-sim \
-  --device <IPAD_UDID> wda-start 8101
+sim --device <IPAD_UDID> wda-start 8101
 ```
 
 Wait for each to print `WDA ready: port=...` before continuing.
@@ -215,7 +218,7 @@ IPAD="<IPAD_UDID>"   # only if IPAD_NEEDED
 
 ### Navigation commands reference
 
-**CRITICAL — each separate Bash tool call costs ~10s of API latency.** Always batch sequential sim.sh calls with `&&` in ONE Bash tool call. 20 calls batched into 5 cuts total time from ~240s to ~60s.
+**CRITICAL — each separate Bash tool call costs ~10s of API latency.** Always batch sequential sim calls with `&&` in ONE Bash tool call. 20 calls batched into 5 cuts total time from ~240s to ~60s.
 
 ```bash
 # ★ Read current screen — do this first on any new screen
@@ -234,7 +237,7 @@ $SIM --device $IPHONE tap-element "<segment_label>" && $SIM --device $IPHONE lay
 # Scroll and check what changed:
 $SIM --device $IPHONE scroll-down && $SIM --device $IPHONE layout-map
 
-# Scroll until an element is visible, then use layout-map to get its coordinates, then tap:
+# Scroll until an element is visible, then tap:
 $SIM --device $IPHONE scroll-to-visible "<label>" 10 && \
   $SIM --device $IPHONE tap-element "<label>"
 
@@ -246,7 +249,7 @@ $SIM --device $IPHONE tap <X_BTN_X> <X_BTN_Y> && $SIM --device $IPHONE wait-for 
 
 **Screenshot naming convention:**
 - `<NN>_<device>_<scenario>.png`
-- Examples: `01_iphone_today_feed.png`, `02_ipad_programs_discover.png`
+- Examples: `01_iphone_home_feed.png`, `02_ipad_detail_view.png`
 
 ### Execute test scenarios
 
@@ -259,25 +262,20 @@ For each scenario in `TEST_SCENARIOS`:
 
 **Key test patterns by library:**
 
-**Nuke (image loading):**
-- Navigate to Today tab via `tap-and-wait` → `scroll-down` → `screenshot` (quest cover art, author thumbnails)
-- Navigate to Programs → `layout-map` to verify content loaded → `screenshot` program list (cover images)
-- Open a program detail → `screenshot` (hero cover image)
+**Image loading (Nuke / SDWebImage / Kingfisher):**
+- Navigate to any feed or list screen → `scroll-down` → `screenshot`
+- Open a detail view that has a hero image → `screenshot`
 - Check: no broken/gray placeholder images visible
 
-**Parchment (paged views):**
-- Navigate to Programs tab → tap each segment via `tap-element` → `layout-map` to verify content → `screenshot` each
-- Navigate to Meditations → tap each segment → `layout-map` to verify → `screenshot`
+**Paged views (Parchment / TabMan):**
+- Navigate to any screen with a segment control or paged tabs
+- Tap each segment via `tap-element` → `layout-map` to verify content loaded → `screenshot`
 - Check: correct content loads per segment, selection indicator moves, scroll works
 
-**Lottie (animations):**
-- Tap each tab bar tab via `tap-and-wait` → `screenshot` after each (animations are frame-captured, not video)
+**Animations (Lottie):**
+- Tap each tab bar tab via `tap-and-wait` → `screenshot` after each
 - Navigate to any screen with a Lottie loading indicator if present
-- Check: tab bar icons render (not blank/invisible), no crash on tab switch
-
-**Eve AI:**
-- Tap Eve AI tab → `layout-map` to confirm chat UI loaded → `screenshot`
-- Check: chat UI loads, no crash
+- Check: animated elements render (not blank/invisible), no crash on interaction
 
 **General (every scenario):**
 - App must not crash
@@ -286,18 +284,9 @@ For each scenario in `TEST_SCENARIOS`:
 
 ---
 
-## Phase 5 — Screenshot Resize & Upload
+## Phase 5 — Screenshots
 
-### Resize and upload in one step
-Use the `--resize 390` flag in the upload script — it handles resizing internally before uploading. No separate `sips` step needed.
-
-```bash
-python3 Scripts/github_upload_image.py \
-  --resize 390 \
-  $SCREENSHOTS_DIR/*.png
-```
-
-Collect all returned `![name](url)` markdown lines. Store as `IMAGE_MARKDOWN`.
+Screenshots are saved to `$SCREENSHOTS_DIR`. Reference them in the PR comment by uploading via your project's preferred method (e.g. drag-drop into the GitHub PR, a project upload script, or `gh` API). Store the resulting markdown image references as `IMAGE_MARKDOWN`.
 
 ---
 
@@ -306,7 +295,7 @@ Collect all returned `![name](url)` markdown lines. Store as `IMAGE_MARKDOWN`.
 Post a structured QA comment to the PR:
 
 ```bash
-gh pr comment <PR_NUMBER> --repo mindvalley/Mobile_iOS_Mindvalley --body "$(cat <<'COMMENT'
+gh pr comment <PR_NUMBER> --repo "$REPO" --body "$(cat <<'COMMENT'
 ## QA Testing — <PR_TITLE>
 
 Tested on **<device list>** · Branch: `<BRANCH_NAME>`
@@ -322,8 +311,8 @@ Tested on **<device list>** · Branch: `<BRANCH_NAME>`
 
 | # | Scenario | Result | Notes |
 |---|---|---|---|
-| EB1 | <scenario description> | ✅ Pass / ❌ Fail | <one-line note> |
-| EB2 | ... | ... | ... |
+| 1 | <scenario description> | ✅ Pass / ❌ Fail | <one-line note> |
+| 2 | ... | ... | ... |
 
 ---
 
@@ -344,16 +333,16 @@ COMMENT
 
 **Comment rules:**
 - Group screenshots by scenario (not by device) — if iPad tested, add an "iPad" column or a separate section
-- Use the exact `EB{N}` labels from the PR description in the results table
+- Use the exact acceptance criteria labels from the PR description in the results table
 - If a scenario can't be tested (e.g., requires login state you don't have), mark as `⚠ Skipped` with reason
 - If anything fails: describe what was observed and include the failure screenshot
 
 ---
 
-## Phase 7 — Cleanup & Return to development
+## Phase 7 — Cleanup & Return to base branch
 
 ```bash
-git checkout development
+git checkout "$BASE_BRANCH"
 ```
 
 Send a macOS notification:
@@ -363,14 +352,14 @@ osascript -e 'display notification "QA complete — comment posted to PR #<N>" w
 
 ---
 
-## Key Constants
+## Key Constants (discovered at runtime)
 
-- **App bundle ID:** `com.mindvalley.mvacademy`
-- **Primary iPhone 16 UDID:** `A0F9CB4E-ECF0-461B-A80E-C20810D732EA`
-- **Build flag:** use `-project Mindvalley.xcodeproj` NOT `-workspace`
-- **DerivedData:** `$(find ~/Library/Developer/Xcode/DerivedData -maxdepth 1 -name "Mindvalley-*" -type d | head -1)` (hash suffix is machine-specific)
-- **sim:** `sim` (installed via `brew install simclaw`)
-- **Upload script:** `python3 Scripts/github_upload_image.py --resize 390`
+- **Repo:** `REPO=$(gh repo view --json nameWithOwner --jq '.nameWithOwner')`
+- **Project:** `XCODEPROJ=$(find . -maxdepth 2 -name "*.xcodeproj" | head -1)`
+- **Scheme:** `SCHEME=$(basename "$XCODEPROJ" .xcodeproj)`
+- **App path:** `find ~/Library/Developer/Xcode/DerivedData -maxdepth 4 -name "${APP_NAME}.app" -path "*/Debug-iphonesimulator/*" | head -1`
+- **Bundle ID:** `defaults read "$APP_PATH/Info.plist" CFBundleIdentifier`
+- **DerivedData:** `find ~/Library/Developer/Xcode/DerivedData -maxdepth 1 -name "${SCHEME}-*" -type d | head -1`
 - **WDA port convention:** iPhone=8100, iPad=8101, second iPhone=8102
 
 ## Error Handling
