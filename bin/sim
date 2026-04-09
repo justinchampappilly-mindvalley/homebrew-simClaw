@@ -235,6 +235,7 @@ Options:
 ── Diagnostics ───────────────────────────────────────────────────────────────
 
   status                                  Print booted device info and screen bounds
+  install-skills                          Copy bundled Claude Code skills to ~/.claude/skills/
 
 All x/y coordinates are iOS logical points.
 Tap center of a layout-map element: x + w/2, y + h/2
@@ -2816,6 +2817,43 @@ done
 CMD="${1:-}"
 shift || true  # 'shift' exits non-zero on empty args under set -e; || true guards this
 
+cmd_install_skills() {
+  # Locate pkgshare: resolve via brew if available, else derive from script location
+  local skills_src=""
+  if command -v brew &>/dev/null; then
+    local prefix
+    prefix=$(brew --prefix simclaw 2>/dev/null) || true
+    [[ -n "$prefix" ]] && skills_src="$prefix/share/simclaw/skills"
+  fi
+  # Fallback: derive from script location (bin/../share/simclaw/skills)
+  if [[ -z "$skills_src" || ! -d "$skills_src" ]]; then
+    local script_dir
+    script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    skills_src="$(dirname "$script_dir")/share/simclaw/skills"
+  fi
+  [[ -d "$skills_src" ]] \
+    || die "install-skills: skills directory not found at $skills_src"
+
+  local skills_dst="$HOME/.claude/skills"
+  mkdir -p "$skills_dst"
+
+  local installed=0
+  for skill_dir in "$skills_src"/*/; do
+    [[ -d "$skill_dir" ]] || continue
+    local skill_name
+    skill_name=$(basename "$skill_dir")
+    mkdir -p "$skills_dst/$skill_name"
+    cp -f "$skill_dir"/* "$skills_dst/$skill_name/"
+    echo "Installed: $skill_name → $skills_dst/$skill_name"
+    (( installed++ )) || true
+  done
+
+  [[ $installed -gt 0 ]] \
+    || die "install-skills: no skills found in $skills_src"
+  echo ""
+  echo "$installed skill(s) installed. Available in any Claude Code session immediately."
+}
+
 case "$CMD" in
   status)       cmd_status                ;;
   setup)        cmd_setup        "$@"    ;;
@@ -2836,6 +2874,7 @@ case "$CMD" in
   wait-for-stable) cmd_wait_for_stable "$@" ;;
   describe-point)  cmd_describe_point "$@"  ;;
   layout-map)      cmd_layout_map           ;;
+  install-skills) cmd_install_skills      ;;
   ""|--help|-h) usage; exit 0           ;;
   *) die "Unknown command: $CMD. Run sim --help for usage." ;;
 esac

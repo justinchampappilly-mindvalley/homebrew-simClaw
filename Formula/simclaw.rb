@@ -16,24 +16,6 @@ class Simclaw < Formula
     pkgshare.install "skills"
   end
 
-  def post_install
-    # Install bundled Claude Code skills into ~/.claude/skills/
-    # This makes the skills available to Claude Code globally across all projects.
-    skills_src = pkgshare/"skills"
-    skills_dst = Pathname.new(ENV["HOME"]) / ".claude/skills"
-    skills_dst.mkpath
-
-    skills_src.each_child do |skill_dir|
-      next unless skill_dir.directory?
-      dst = skills_dst / skill_dir.basename
-      dst.mkpath
-      skill_dir.each_child do |f|
-        FileUtils.cp f, dst / f.basename
-      end
-      opoo "Installed Claude skill: #{skill_dir.basename} → #{dst}"
-    end
-  end
-
   def caveats
     <<~EOS
       sim requires WebDriverAgent (WDA) for tap/swipe commands.
@@ -45,10 +27,12 @@ class Simclaw < Formula
 
         sim --device <UDID> setup <bundle_id_or_app_path>
 
-      Claude Code skills have been installed to:
-        ~/.claude/skills/
+      To install bundled Claude Code skills (qa-branch and others):
 
-      They are available immediately in any Claude Code session.
+        sim install-skills
+
+      This copies skills to ~/.claude/skills/ making them available in any
+      Claude Code session immediately.
 
       Full docs: https://github.com/justinchampappilly-mindvalley/homebrew-simClaw
     EOS
