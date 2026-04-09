@@ -1,10 +1,10 @@
 class Simclaw < Formula
   desc "iOS Simulator interaction CLI for developers and AI agents"
   homepage "https://github.com/justinchampappilly-mindvalley/homebrew-simClaw"
-  url "https://github.com/justinchampappilly-mindvalley/homebrew-simClaw/archive/refs/tags/v1.0.2.tar.gz"
-  sha256 "83d9538089fdc2ccd7da5c855eb0b4e4a2211c5b9f474648f9edbe3da285b34b"
+  url "https://github.com/justinchampappilly-mindvalley/homebrew-simClaw/archive/refs/tags/v1.0.3.tar.gz"
+  sha256 "11d564af8e250a5d8cea22ccc2b9a2172d59df43e6cd951d2970124ff5de1553"
   license "MIT"
-  version "1.0.2"
+  version "1.0.3"
 
   # Runtime dependencies
   depends_on "jq"
