@@ -1,5 +1,5 @@
 #!/bin/bash
-# sim.sh
+# sim
 #
 # Standalone CLI tool for interacting with a running iOS Simulator.
 # Uses WebDriverAgent (WDA) for touch injection and xcrun simctl.
@@ -9,7 +9,7 @@
 # ── QUICK START FOR AI AGENTS ─────────────────────────────────────────────────
 #
 # STEP 0 — Start WDA (required once per simulator session, before any tap/swipe):
-#   sim.sh --device <UDID> wda-start <port>
+#   sim --device <UDID> wda-start <port>
 #   WDA (WebDriverAgent) runs inside the simulator as an XCUITest runner.
 #   All taps and swipes are routed through WDA's W3C Actions API →
 #   XCTest → testmanagerd → synthetic IOHIDEvent. This is fully UDID-scoped
@@ -40,8 +40,8 @@
 #   Use `layout-map` instead — it gives structured JSON with labels, coordinates,
 #   scroll hints, and suggested_actions. It's always faster and more useful.
 #
-#   WRONG:  sim.sh screenshot /tmp/s.png   ← then read the image to decide next step
-#   RIGHT:  sim.sh layout-map              ← JSON tells you exactly what's on screen
+#   WRONG:  sim screenshot /tmp/s.png   ← then read the image to decide next step
+#   RIGHT:  sim layout-map              ← JSON tells you exactly what's on screen
 #
 # ✗ WRONG — verifying navigation with an intermediate screenshot:
 #   After `tap-element` or `tap-and-wait`, agents often take a screenshot to
@@ -56,8 +56,8 @@
 #   scrolled out of view, tap-element will FAIL. Always use `scroll-to-visible`
 #   first when unsure, then `tap-element`.
 #
-#   WRONG:  sim.sh tap-element "Deep Sleep"         ← fails if off-screen
-#   RIGHT:  sim.sh scroll-to-visible "Deep Sleep" && sim.sh tap-element "Deep Sleep"
+#   WRONG:  sim tap-element "Deep Sleep"         ← fails if off-screen
+#   RIGHT:  sim scroll-to-visible "Deep Sleep" && sim tap-element "Deep Sleep"
 #
 # ── OPTIMAL NAVIGATION PATTERN ────────────────────────────────────────────────
 #
@@ -65,19 +65,19 @@
 #
 #   INEFFICIENT (observed: 7–9 tool calls):
 #     call 1: screenshot → Read image                    ← 2 calls wasted
-#     call 2: tap-element "Meditations"
+#     call 2: tap-element "Settings"
 #     call 3: screenshot → Read image                    ← 2 more calls wasted
-#     call 4: scroll-to-visible "Speak and Inspire"
-#     call 5: tap-element "Speak and Inspire"
+#     call 4: scroll-to-visible "Privacy"
+#     call 5: tap-element "Privacy"
 #     call 6: screenshot → Read image                    ← 2 more calls wasted
 #
 #   OPTIMAL (3 tool calls for the same result):
-#     call 1: sim.sh layout-map                          ← see current state
-#     call 2: sim.sh tap-and-wait "Meditations" "Meditations" 5 && \
-#             sim.sh scroll-to-visible "Speak and Inspire" && \
-#             sim.sh tap-and-wait "Speak and Inspire"    ← navigate + scroll + tap, chained
+#     call 1: sim layout-map                             ← see current state
+#     call 2: sim tap-and-wait "Settings" "Settings" 5 && \
+#             sim scroll-to-visible "Privacy" && \
+#             sim tap-and-wait "Privacy"                 ← navigate + scroll + tap, chained
 #     call 3: (only needed if you want to inspect the result screen)
-#             sim.sh layout-map
+#             sim layout-map
 #
 #   Taps are UDID-scoped via WDA — no global serialization needed. Two simulators
 #   can receive taps concurrently without interfering with each other.
@@ -91,30 +91,30 @@
 #     "modal": false,               -- true when no nav bar + close button present
 #     "navigation": {
 #       "title": "Account",
-#       "back": {"label":"icoBack","x":27,"y":76},   -- null if no back button
-#       "tabs": [{"label":"Today","x":39,"y":795,"selected":true}, ...]
+#       "back": {"label":"Back","x":27,"y":76},       -- null if no back button
+#       "tabs": [{"label":"Home","x":39,"y":795,"selected":true}, ...]
 #     },
 #     "interactive": [              -- x,y are TOP-LEFT; tap center = x+w/2, y+h/2
-#       {"role":"AXButton","label":"View Profile","x":33,"y":234,"w":121,"h":40,"value":null,"enabled":true}
+#       {"role":"AXButton","label":"Sign In","x":33,"y":234,"w":121,"h":40,"value":null,"enabled":true}
 #     ],
 #     "content": {
-#       "headings": [],
-#       "texts": ["Justin Champappilly", "2", "DAY STREAK", ...]
+#       "headings": ["Welcome"],
+#       "texts": ["Jane Smith", "Settings", ...]
 #     },
 #     "scroll": {
 #       "vertical": true,           -- true if scrollable content exists
 #       "horizontal": false,
 #       "above_fold": [],           -- labels of interactive/heading elements above current view
-#       "below_fold": ["Library","Favorites","Downloads"]  -- labels reachable by scrolling down
+#       "below_fold": ["Notifications","Privacy","Help"]  -- labels reachable by scrolling down
 #     },
 #     "context": "tab_screen",      -- screen type classifier:
 #                                   --   "media_player" | "modal_sheet" | "search" | "form"
 #                                   --   "tab_screen" | "list" | "detail_screen" | "unknown"
 #     "suggested_actions": [        -- pre-validated labels ready for tap-and-wait; prefer these
-#       "tap 'View Profile' at (93, 254)",
-#       "tap tab 'Library' at (196, 795)",
-#       "scroll down to reveal: Favorites, Downloads",
-#       "tap back 'icoBack' at (27, 76) to return"
+#       "tap 'Sign In' at (93, 254)",
+#       "tap tab 'Home' at (196, 795)",
+#       "scroll down to reveal: Notifications, Help",
+#       "tap back 'Back' at (27, 76) to return"
 #     ]
 #   }
 #
@@ -155,7 +155,7 @@ die() { echo "ERROR: $*" >&2; exit 1; }
 
 usage() {
   cat <<'EOF'
-Usage: sim.sh [--device <UDID>] <command> [args]
+Usage: sim [--device <UDID>] <command> [args]
 
 Options:
   --device <UDID>    Target a specific simulator by UDID (default: most recently booted)
@@ -219,8 +219,8 @@ Options:
                                           otherwise the argument is treated as a bundle ID
                                           (app assumed already installed). Default port: 8100.
                                           Requires /tmp/WebDriverAgent to be cloned first.
-                                          Usage: sim.sh --device <UDID> setup /path/to/App.app
-                                                 sim.sh --device <UDID> setup com.example.app --port 8101
+                                          Usage: sim --device <UDID> setup /path/to/App.app
+                                                 sim --device <UDID> setup com.example.app --port 8101
 
   wda-start [port]                        ★ REQUIRED before any tap or swipe command.
                                           Starts WDA inside the target simulator using a
@@ -230,7 +230,7 @@ Options:
                                           Each simulator needs its own port (default 8100).
                                           Run once per simulator session; subsequent taps
                                           reuse the cached session automatically.
-                                          Usage: sim.sh --device <UDID> wda-start 8100
+                                          Usage: sim --device <UDID> wda-start 8100
 
 ── Diagnostics ───────────────────────────────────────────────────────────────
 
@@ -244,38 +244,38 @@ Tap center of a layout-map element: x + w/2, y + h/2
   STARTING FROM SCRATCH (cold simulator or unknown state):
 
   # Step 0 — one-shot setup: boots sim, builds WDA if needed, installs + launches app:
-  sim.sh --device <UDID> setup /path/to/App.app
+  sim --device <UDID> setup /path/to/App.app
   # or, if app is already installed:
-  sim.sh --device <UDID> setup com.example.myapp --port 8100
+  sim --device <UDID> setup com.example.myapp --port 8100
 
   STARTING FROM A WARM SESSION (sim already booted, app installed, WDA may be running):
 
   # Step 0 — start WDA only (skip if setup was already run):
-  sim.sh --device <UDID> wda-start 8100
+  sim --device <UDID> wda-start 8100
 
   THEN NAVIGATE (applies to both flows above):
 
   # Step 1 — understand current screen (includes suggested_actions):
-  sim.sh --device <UDID> layout-map
+  sim --device <UDID> layout-map
 
   # Step 2 — navigate using tap-and-wait (find + tap + wait + read = 1 call):
-  sim.sh --device <UDID> tap-and-wait "Sign In" "Home" 10
+  sim --device <UDID> tap-and-wait "Sign In" "Home" 10
 
   # Step 3 — navigate again using a label from the new layout-map's suggested_actions:
-  sim.sh --device <UDID> tap-and-wait "View Profile" "Profile" 8
+  sim --device <UDID> tap-and-wait "View Profile" "Profile" 8
 
   # tip: tap-and-wait + layout-map together enable compound navigation steps —
   # each call does: find element + tap + wait for next screen + read new screen.
   # This is 1 tool call instead of 4 (find-element + tap + wait-for + layout-map).
 
   # When tap-and-wait is not suitable (e.g. raw coordinate tap), use:
-  sim.sh --device <UDID> tap 35 81 && sim.sh --device <UDID> wait-for "Next Screen" 10
+  sim --device <UDID> tap 35 81 && sim --device <UDID> wait-for "Next Screen" 10
 
   RUNNING MULTIPLE SIMULATORS IN PARALLEL:
 
   # Each simulator needs its own WDA port and its own --device flag:
-  sim.sh --device <UDID1> setup com.example.myapp --port 8100
-  sim.sh --device <UDID2> setup com.example.myapp --port 8101
+  sim --device <UDID1> setup com.example.myapp --port 8100
+  sim --device <UDID2> setup com.example.myapp --port 8101
   # Tap commands to each simulator are fully independent (no global serialisation needed)
 
 EOF
@@ -1001,13 +1001,13 @@ _wda_write_cache() {
 #   1. WDA_PORT and WDA_SESSION are non-empty (loaded from cache or wda-start).
 #   2. The session is live: GET /session/:id returns HTTP 200.
 # If either check fails, it dies with an actionable error telling the agent to
-# run `sim.sh --device <UDID> wda-start <port>` to restart WDA.
+# run `sim --device <UDID> wda-start <port>` to restart WDA.
 # This guard ensures every tap/swipe is UDID-scoped and routed correctly —
 # there is no fallback to CGEvent or any other global input injection.
 _wda_ensure() {
   if [[ -z "$WDA_PORT" || -z "$WDA_SESSION" ]]; then
     local udid_hint="${SIM_TARGET_UDID:-<UDID>}"
-    die "WDA not running. Start with: sim.sh --device ${udid_hint} wda-start <port>"
+    die "WDA not running. Start with: sim --device ${udid_hint} wda-start <port>"
   fi
   # Quick liveness check — GET /session/:id (WDA returns 200 if alive)
   local http_code
@@ -1019,7 +1019,7 @@ _wda_ensure() {
     WDA_PORT=""
     WDA_SESSION=""
     local udid_hint="${SIM_TARGET_UDID:-<UDID>}"
-    die "WDA session is no longer alive (HTTP ${http_code:-timeout}). Restart with: sim.sh --device ${udid_hint} wda-start <port>"
+    die "WDA session is no longer alive (HTTP ${http_code:-timeout}). Restart with: sim --device ${udid_hint} wda-start <port>"
   fi
 }
 
@@ -1172,7 +1172,7 @@ cmd_status() {
 }
 
 cmd_tap() {
-  [[ $# -ge 2 ]] || die "Usage: sim.sh tap <x> <y>"
+  [[ $# -ge 2 ]] || die "Usage: sim tap <x> <y>"
   _is_integer "$1" || die "tap: x must be an integer, got: $1"
   _is_integer "$2" || die "tap: y must be an integer, got: $2"
   _bootstrap
@@ -1180,7 +1180,7 @@ cmd_tap() {
 }
 
 cmd_tap_element() {
-  [[ $# -ge 1 ]] || die "Usage: sim.sh tap-element <label>"
+  [[ $# -ge 1 ]] || die "Usage: sim tap-element <label>"
   local label="$1"
   _bootstrap
 
@@ -1313,7 +1313,7 @@ POSTEOF
 }
 
 cmd_tap_and_wait() {
-  [[ $# -ge 1 ]] || die "Usage: sim.sh tap-and-wait <label> [expected_label] [timeout]"
+  [[ $# -ge 1 ]] || die "Usage: sim tap-and-wait <label> [expected_label] [timeout]"
   local label="$1"
   local expected_label="${2:-}"
   local timeout="${3:-10}"
@@ -1355,7 +1355,7 @@ cmd_tap_and_wait() {
 }
 
 cmd_swipe() {
-  [[ $# -ge 4 ]] || die "Usage: sim.sh swipe <x1> <y1> <x2> <y2> [steps] [step_ms]"
+  [[ $# -ge 4 ]] || die "Usage: sim swipe <x1> <y1> <x2> <y2> [steps] [step_ms]"
   _is_integer "$1" || die "swipe: x1 must be an integer, got: $1"
   _is_integer "$2" || die "swipe: y1 must be an integer, got: $2"
   _is_integer "$3" || die "swipe: x2 must be an integer, got: $3"
@@ -1388,7 +1388,7 @@ cmd_scroll_down() {
 }
 
 cmd_scroll_to_visible() {
-  [[ $# -ge 1 ]] || die "Usage: sim.sh scroll-to-visible <label> [max_swipes]"
+  [[ $# -ge 1 ]] || die "Usage: sim scroll-to-visible <label> [max_swipes]"
   local label="$1"
   local max_swipes="${2:-10}"
   _bootstrap
@@ -1808,7 +1808,7 @@ SWIFTEOF
 }
 
 cmd_find_element() {
-  [[ $# -ge 1 ]] || die "Usage: sim.sh find-element <label>"
+  [[ $# -ge 1 ]] || die "Usage: sim find-element <label>"
   local search_label="$1"
   _bootstrap
 
@@ -1867,7 +1867,7 @@ print(json.dumps({'role': 'XCUIElement', 'label': label, 'x': x, 'y': y, 'w': w,
 }
 
 cmd_describe_point() {
-  [[ $# -ge 2 ]] || die "Usage: sim.sh describe-point <x> <y>"
+  [[ $# -ge 2 ]] || die "Usage: sim describe-point <x> <y>"
   _is_integer "$1" || die "describe-point: x must be an integer, got: $1"
   _is_integer "$2" || die "describe-point: y must be an integer, got: $2"
   _bootstrap
@@ -2013,7 +2013,7 @@ def iattr(el, key, default=0):
         return default
 
 def name(el):
-    # Prefer label over name — name often has internal IDs like "TabBar.Meditations.Item"
+    # Prefer label over name — name often has internal IDs like "TabBar.Settings.Item"
     lbl = el.get("label", "")
     nm  = el.get("name", "")
     return lbl if lbl else nm
@@ -2397,7 +2397,7 @@ PYEOF
 }
 
 cmd_wait_for() {
-  [[ $# -ge 1 ]] || die "Usage: sim.sh wait-for <label> [timeout_seconds]"
+  [[ $# -ge 1 ]] || die "Usage: sim wait-for <label> [timeout_seconds]"
   local search_label="$1"
   local timeout="${2:-10}"
   # Bootstrap to get SIM_NAME for window targeting when multiple simulators are open.
@@ -2629,7 +2629,7 @@ SWIFTEOF
 }
 
 cmd_type() {
-  [[ $# -ge 1 ]] || die "Usage: sim.sh type <text>"
+  [[ $# -ge 1 ]] || die "Usage: sim type <text>"
   local text="$1"
   _bootstrap
 
@@ -2665,7 +2665,7 @@ cmd_setup() {
     esac
   done
 
-  [[ -n "$app_arg" ]] || die "Usage: sim.sh [--device <UDID>] setup <app_path_or_bundle_id> [--port <wda_port>]"
+  [[ -n "$app_arg" ]] || die "Usage: sim [--device <UDID>] setup <app_path_or_bundle_id> [--port <wda_port>]"
 
   # ── Step 1: Detect / boot simulator ─────────────────────────────────────────
 
@@ -2786,7 +2786,7 @@ cmd_setup() {
 }
 
 cmd_screenshot() {
-  [[ $# -ge 1 ]] || die "Usage: sim.sh screenshot <output.png>"
+  [[ $# -ge 1 ]] || die "Usage: sim screenshot <output.png>"
   local outdir
   outdir=$(dirname "$1")
   [[ -d "$outdir" ]] || die "Output directory does not exist: $outdir"
@@ -2798,14 +2798,14 @@ cmd_screenshot() {
 
 # ── Main Dispatch ─────────────────────────────────────────────────────────────
 
-# Accept UDID env var as a shorthand for --device (e.g. UDID=<udid> bash sim.sh <cmd>)
+# Accept UDID env var as a shorthand for --device (e.g. UDID=<udid> bash sim <cmd>)
 [[ -z "$SIM_TARGET_UDID" && -n "${UDID:-}" ]] && SIM_TARGET_UDID="$UDID"
 
 # Parse optional --device flag (in any order) before the command name
 while true; do
   case "${1:-}" in
     --device)
-      [[ $# -ge 2 ]] || die "Usage: sim.sh --device <UDID> <command> [args]"
+      [[ $# -ge 2 ]] || die "Usage: sim --device <UDID> <command> [args]"
       SIM_TARGET_UDID="$2"
       shift 2
       ;;
@@ -2837,5 +2837,5 @@ case "$CMD" in
   describe-point)  cmd_describe_point "$@"  ;;
   layout-map)      cmd_layout_map           ;;
   ""|--help|-h) usage; exit 0           ;;
-  *) die "Unknown command: $CMD. Run sim.sh --help for usage." ;;
+  *) die "Unknown command: $CMD. Run sim --help for usage." ;;
 esac
