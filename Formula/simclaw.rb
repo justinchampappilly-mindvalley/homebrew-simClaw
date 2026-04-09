@@ -20,6 +20,25 @@ class Simclaw < Formula
 
   def install
     bin.install "bin/sim"
+    pkgshare.install "skills"
+  end
+
+  def post_install
+    # Install bundled Claude Code skills into ~/.claude/skills/
+    # This makes the skills available to Claude Code globally across all projects.
+    skills_src = pkgshare/"skills"
+    skills_dst = Pathname.new(ENV["HOME"]) / ".claude/skills"
+    skills_dst.mkpath
+
+    skills_src.each_child do |skill_dir|
+      next unless skill_dir.directory?
+      dst = skills_dst / skill_dir.basename
+      dst.mkpath
+      skill_dir.each_child do |f|
+        FileUtils.cp f, dst / f.basename
+      end
+      opoo "Installed Claude skill: #{skill_dir.basename} → #{dst}"
+    end
   end
 
   def caveats
@@ -32,6 +51,11 @@ class Simclaw < Formula
       Then start a session before using tap/swipe:
 
         sim --device <UDID> setup <bundle_id_or_app_path>
+
+      Claude Code skills have been installed to:
+        ~/.claude/skills/
+
+      They are available immediately in any Claude Code session.
 
       Full docs: https://github.com/mindvalley/homebrew-sim
     EOS
