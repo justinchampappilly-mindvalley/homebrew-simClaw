@@ -148,6 +148,9 @@ SIM_ZOOM=""
 SIM_TARGET_UDID=""
 WDA_PORT=""
 WDA_SESSION=""
+# layout-map tuning: timeout (s) for the WDA /source fetch.
+# Large AX trees (e.g. Mindvalley) can exceed 8s; raise via --source-timeout N or env.
+LAYOUT_MAP_SOURCE_TIMEOUT="${LAYOUT_MAP_SOURCE_TIMEOUT:-8}"
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -1124,11 +1127,23 @@ cmd_wda_start() {
   # Create a W3C WebDriver session. WDA requires an active session before
   # accepting any /actions (tap/swipe) requests. The session ID is returned
   # in the response body and cached in the bootstrap cache for reuse.
+  #
+  # If WDA_APP_BUNDLE_ID is set, include it in the session capabilities so
+  # WDA pins its active-application resolution to that specific app. This
+  # prevents the background-window mismatch bug on iPad simulators where
+  # WDA's hit-test heuristic (FBActiveAppDetectionPoint) selects a persistent
+  # background window (e.g. the onboarding/auth flow) instead of the visible
+  # foreground content.
   echo "Creating WDA session..."
-  local session_resp
+  local session_caps session_resp
+  if [[ -n "${WDA_APP_BUNDLE_ID:-}" ]]; then
+    session_caps="{\"capabilities\":{\"alwaysMatch\":{\"bundleId\":\"${WDA_APP_BUNDLE_ID}\"}}}"
+  else
+    session_caps='{"capabilities":{"firstMatch":[{}]}}'
+  fi
   session_resp=$(curl -s -X POST \
     -H "Content-Type: application/json" \
-    -d '{"capabilities":{"firstMatch":[{}]}}' \
+    -d "$session_caps" \
     --max-time 15 \
     "http://localhost:${port}/session" 2>/dev/null) \
     || die "Failed to POST /session to WDA on port ${port}"
@@ -1144,11 +1159,64 @@ cmd_wda_start() {
   WDA_PORT="$port"
   WDA_SESSION="$session_id"
 
+  # Belt-and-suspenders: pin defaultActiveApplication via Appium settings so
+  # that even if the session capability above is ignored, WDA's element queries
+  # resolve against the correct foreground app rather than any background window.
+  if [[ -n "${WDA_APP_BUNDLE_ID:-}" ]]; then
+    curl -s -X POST \
+      -H "Content-Type: application/json" \
+      -d "{\"settings\":{\"defaultActiveApplication\":\"${WDA_APP_BUNDLE_ID}\"}}" \
+      --max-time 5 \
+      "http://localhost:${port}/session/${WDA_SESSION}/appium/settings" \
+      > /dev/null 2>&1 || true
+    echo "WDA: pinned defaultActiveApplication to ${WDA_APP_BUNDLE_ID}"
+  fi
+
+  # Tune WDA serialization performance:
+  # - snapshotMaxDepth 15: prune deep subtrees (default 50), biggest speed win
+  # - snapshotMaxChildren 25: cap sibling count in list views
+  # - pageSourceExcludedAttributes: skip computed-per-element attrs (visible, accessible)
+  #   that WDA must derive rather than just read — confirmed significant speedup
+  curl -s -X POST \
+    -H "Content-Type: application/json" \
+    -d '{"settings":{"snapshotMaxDepth":15,"snapshotMaxChildren":25,"pageSourceExcludedAttributes":"visible,accessible"}}' \
+    --max-time 5 \
+    "http://localhost:${port}/session/${WDA_SESSION}/appium/settings" \
+    > /dev/null 2>&1 || true
+  echo "WDA: applied performance settings (snapshotMaxDepth=15, snapshotMaxChildren=25)"
+
   # Persist port and session ID to the bootstrap cache so tap/swipe commands
   # in subsequent invocations can reuse the running WDA without re-starting it.
   _wda_write_cache
 
   echo "WDA ready: port=${WDA_PORT} session=${WDA_SESSION}"
+}
+
+# Pin WDA's active application to a specific bundle ID mid-session.
+# Useful as a recovery step when element queries return elements from the
+# wrong window (background onboarding window instead of foreground content).
+# Usage: sim --device <UDID> ensure-foreground-app [bundle_id]
+cmd_ensure_foreground_app() {
+  local bundle_id="${1:-${WDA_APP_BUNDLE_ID:-com.mindvalley.mvacademy}}"
+  _bootstrap
+
+  # Re-pin defaultActiveApplication
+  curl -s -X POST \
+    -H "Content-Type: application/json" \
+    -d "{\"settings\":{\"defaultActiveApplication\":\"${bundle_id}\"}}" \
+    --max-time 5 \
+    "http://localhost:${WDA_PORT}/session/${WDA_SESSION}/appium/settings" \
+    > /dev/null 2>&1 || true
+
+  # Activate the app to ensure it is in the foreground
+  curl -s -X POST \
+    -H "Content-Type: application/json" \
+    -d "{\"bundleId\":\"${bundle_id}\"}" \
+    --max-time 10 \
+    "http://localhost:${WDA_PORT}/session/${WDA_SESSION}/wda/apps/activate" \
+    > /dev/null 2>&1 || true
+
+  echo "Ensured foreground app: ${bundle_id}"
 }
 
 # ── Commands ──────────────────────────────────────────────────────────────────
@@ -1982,34 +2050,285 @@ SWIFTEOF
   echo "$result"
 }
 
+# _layout_map_elements_fallback [filter]
+# Called when WDA /source times out (AX tree too large).
+# Uses fast targeted /elements queries (class name lookups) instead of a full source dump.
+# Returns the same JSON schema as cmd_layout_map — interactive, tabs, nav title, back.
+# Each class-name query completes in <1s vs the multi-second /source serialization.
+_layout_map_elements_fallback() {
+  local layout_filter="${1:-all}"
+  local lw="${SIM_LOGICAL_W:-393}"
+  local lh="${SIM_LOGICAL_H:-852}"
+  local base="http://localhost:${WDA_PORT}/session/${WDA_SESSION}"
+
+  # ── Build per-class element-query helper script ───────────────────────────────
+  local tmp_el_py tmp_asm tmp_enrich
+  tmp_el_py=$(mktemp -t sim_el_query)
+  tmp_asm=$(mktemp -t sim_el_asm)
+  tmp_enrich=$(mktemp -t sim_el_enrich)
+
+  # element_query.py: POST /elements by class name, fetch rect+label per element
+  python3 -c "
+import textwrap, sys
+script = textwrap.dedent('''
+    import sys, json, urllib.request
+    base = sys.argv[1]
+    class_name = sys.argv[2]
+    logical_h = int(sys.argv[3]) if len(sys.argv) > 3 else 852
+    max_els = int(sys.argv[4]) if len(sys.argv) > 4 else 40
+
+    def wda_get(path, timeout=5):
+        try:
+            with urllib.request.urlopen(base + path, timeout=timeout) as r:
+                return json.loads(r.read())
+        except Exception:
+            return {}
+
+    def wda_post(path, data, timeout=5):
+        body = json.dumps(data).encode()
+        req = urllib.request.Request(base + path, data=body,
+                                     headers={\"Content-Type\": \"application/json\"})
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                return json.loads(r.read())
+        except Exception:
+            return {}
+
+    resp = wda_post(\"/elements\", {\"using\": \"class name\", \"value\": class_name})
+    els = resp.get(\"value\", [])
+    if not isinstance(els, list):
+        print(\"[]\"); sys.exit(0)
+
+    results = []
+    seen = set()
+    for el in els[:max_els]:
+        eid = el.get(\"ELEMENT\") or el.get(\"element-6066-11e4-a52e-4f735466cecf\", \"\")
+        if not eid: continue
+        lbl = (wda_get(f\"/element/{eid}/attribute/label\")).get(\"value\") or \"\"
+        nm  = (wda_get(f\"/element/{eid}/attribute/name\")).get(\"value\") or \"\"
+        label = lbl if lbl else nm
+        r2 = (wda_get(f\"/element/{eid}/rect\")).get(\"value\", {})
+        x = int(r2.get(\"x\", 0)); y = int(r2.get(\"y\", 0))
+        w = int(r2.get(\"width\", 0)); h = int(r2.get(\"height\", 0))
+        if w == 0 or h == 0: continue
+        key = label + f\"|{x},{y}\"
+        if key in seen: continue
+        seen.add(key)
+        if y > logical_h * 1.5: continue
+        results.append({\"label\": label, \"x\": x, \"y\": y, \"w\": w, \"h\": h})
+    print(json.dumps(results))
+''').lstrip()
+sys.stdout.write(script)
+" > "$tmp_el_py"
+
+  # ── Query WDA by class name ──────────────────────────────────────────────────
+  local btn_json tabbar_json navbar_json tf_json sw_json sf_json
+  btn_json=$(python3 "$tmp_el_py" "$base" "XCUIElementTypeButton" "$lh" "50") || btn_json="[]"
+  tabbar_json=$(python3 "$tmp_el_py" "$base" "XCUIElementTypeTabBar" "$lh" "1") || tabbar_json="[]"
+  navbar_json=$(python3 "$tmp_el_py" "$base" "XCUIElementTypeNavigationBar" "$lh" "1") || navbar_json="[]"
+  if [[ "$layout_filter" != "buttons" ]]; then
+    tf_json=$(python3 "$tmp_el_py" "$base" "XCUIElementTypeTextField" "$lh" "10") || tf_json="[]"
+    sw_json=$(python3 "$tmp_el_py" "$base" "XCUIElementTypeSwitch" "$lh" "10") || sw_json="[]"
+    sf_json=$(python3 "$tmp_el_py" "$base" "XCUIElementTypeSearchField" "$lh" "5") || sf_json="[]"
+  else
+    tf_json="[]"; sw_json="[]"; sf_json="[]"
+  fi
+  rm -f "$tmp_el_py"
+
+  # ── Assemble raw layout-map JSON ─────────────────────────────────────────────
+  python3 -c "
+import textwrap, sys
+script = textwrap.dedent('''
+    import sys, json
+    logical_w = int(sys.argv[1])
+    logical_h = int(sys.argv[2])
+    btn_json    = json.loads(sys.argv[3])
+    tabbar_json = json.loads(sys.argv[4])
+    navbar_json = json.loads(sys.argv[5])
+    tf_json     = json.loads(sys.argv[6])
+    sw_json     = json.loads(sys.argv[7])
+    sf_json     = json.loads(sys.argv[8])
+
+    tab_bar_top = logical_h
+    tab_bar_rect = None
+    if tabbar_json:
+        tb = tabbar_json[0]
+        tab_bar_top = tb[\"y\"]
+        tab_bar_rect = tb
+
+    nav_bar_bottom = 0; nav_title = None; back_info = None
+    if navbar_json:
+        nb = navbar_json[0]
+        nav_bar_bottom = nb[\"y\"] + nb[\"h\"]
+        nav_title = nb[\"label\"] if nb[\"label\"] else None
+
+    tabs = []; content_buttons = []
+    for btn in btn_json:
+        bx = btn[\"x\"]; by = btn[\"y\"]; bw = btn[\"w\"]; bh = btn[\"h\"]
+        cy_center = by + bh // 2
+        if tab_bar_rect and cy_center >= tab_bar_top:
+            tabs.append({\"label\": btn[\"label\"], \"selected\": False,
+                         \"x\": bx + bw // 2, \"y\": by + bh // 2})
+        elif nav_bar_bottom > 0 and cy_center < nav_bar_bottom:
+            lbl_lower = btn[\"label\"].lower()
+            if \"back\" in lbl_lower or btn[\"label\"] == \"\":
+                if back_info is None:
+                    back_info = {\"label\": btn[\"label\"] or \"Back\",
+                                 \"x\": bx + bw // 2, \"y\": by + bh // 2}
+        else:
+            if by < tab_bar_top:
+                content_buttons.append(btn)
+
+    if back_info is None and not navbar_json:
+        for btn in btn_json:
+            bx = btn[\"x\"]; by = btn[\"y\"]; bw = btn[\"w\"]; bh = btn[\"h\"]
+            if \"back\" in btn[\"label\"].lower() and by < logical_h * 0.15:
+                back_info = {\"label\": btn[\"label\"] or \"Back\",
+                             \"x\": bx + bw // 2, \"y\": by + bh // 2}; break
+
+    interactive = []; seen_keys = set()
+    def add_interactive(els, role):
+        for el in els:
+            key = role + \"|\" + el[\"label\"] + f\"|{el[chr(120)]},{el[chr(121)]}\"
+            if key in seen_keys: continue
+            seen_keys.add(key)
+            interactive.append({\"role\": role, \"label\": el[\"label\"],
+                \"x\": el[\"x\"], \"y\": el[\"y\"], \"w\": el[\"w\"], \"h\": el[\"h\"],
+                \"value\": None, \"enabled\": True})
+    add_interactive(content_buttons, \"AXButton\")
+    add_interactive(tf_json, \"AXTextField\")
+    add_interactive(sw_json, \"AXSwitch\")
+    add_interactive(sf_json, \"AXSearchField\")
+
+    output = {
+        \"screen\": {\"w\": logical_w, \"h\": logical_h},
+        \"modal\": False,
+        \"navigation\": {\"title\": nav_title, \"back\": back_info, \"tabs\": tabs},
+        \"interactive\": interactive,
+        \"content\": {\"headings\": [], \"texts\": []},
+        \"scroll\": {\"vertical\": True, \"horizontal\": False,
+                   \"above_fold\": [], \"below_fold\": []},
+        \"_source\": \"elements_fallback\",
+    }
+    print(json.dumps(output))
+''').lstrip()
+sys.stdout.write(script)
+" > "$tmp_asm"
+
+  local asm_result
+  asm_result=$(python3 "$tmp_asm" \
+    "$lw" "$lh" \
+    "$btn_json" "$tabbar_json" "$navbar_json" \
+    "$tf_json" "$sw_json" "$sf_json") || asm_result=""
+  rm -f "$tmp_asm"
+
+  if [[ -z "$asm_result" ]]; then
+    echo "ERROR: element-query fallback assembly failed" >&2
+    printf '{"screen":{"w":%s,"h":%s},"navigation":{"title":null,"tabs":[],"back":null},"interactive":[],"content":{"headings":[],"texts":[]},"scroll":{"vertical":true,"horizontal":false,"above_fold":[],"below_fold":[]},"context":"unknown","suggested_actions":[],"_warning":"Both WDA /source and element fallback failed."}\n' \
+      "$lw" "$lh"
+    return 1
+  fi
+
+  # ── Enrich with context + suggested_actions ───────────────────────────────────
+  python3 -c "
+import textwrap, sys
+script = textwrap.dedent('''
+    import json, sys
+    with open(sys.argv[1]) as f: data = json.load(f)
+    interactive = data.get(\"interactive\", [])
+    navigation  = data.get(\"navigation\", {})
+    scroll      = data.get(\"scroll\", {})
+    modal       = data.get(\"modal\", False)
+    tabs        = navigation.get(\"tabs\", [])
+    back        = navigation.get(\"back\")
+    nav_title   = navigation.get(\"title\")
+
+    def has_role(r): return any(el.get(\"role\",\"\") == r for el in interactive)
+    def has_lbl(words):
+        for el in interactive:
+            l = el.get(\"label\",\"\").lower()
+            if any(w.lower() in l for w in words): return True
+        return False
+    def has_close(): return any(k in el.get(\"label\",\"\").lower() for el in interactive for k in [\"close\",\"dismiss\",\"cancel\"])
+
+    context = \"unknown\"
+    has_back = back is not None; has_tabs = len(tabs) >= 1
+    if has_lbl([\"play\",\"pause\"]) or (has_role(\"AXSlider\") and has_back and not has_tabs): context = \"media_player\"
+    elif modal or (not nav_title and has_close()): context = \"modal_sheet\"
+    elif has_role(\"AXSearchField\"): context = \"search\"
+    elif has_role(\"AXTextField\") or has_role(\"AXSecureTextField\"): context = \"form\"
+    elif len(tabs) >= 3: context = \"tab_screen\"
+    elif scroll.get(\"vertical\") and len(interactive) > 3: context = \"detail_screen\" if (has_back and not has_tabs) else \"list\"
+    elif has_back and not has_tabs: context = \"detail_screen\"
+
+    suggested = []
+    for tab in tabs:
+        if tab.get(\"selected\"): continue
+        suggested.append(\"tap tab \" + repr(tab.get(\"label\",\"?\")) + \" at (\" + str(tab.get(\"x\",0)) + \", \" + str(tab.get(\"y\",0)) + \")\")
+    if back: suggested.append(\"tap back \" + repr(back.get(\"label\",\"Back\")) + \" at (\" + str(back.get(\"x\",0)) + \", \" + str(back.get(\"y\",0)) + \") to return\")
+    bl = back.get(\"label\",\"\").lower() if back else None
+    cnt = 0
+    for el in interactive:
+        if cnt >= 6: break
+        lbl = el.get(\"label\",\"\")
+        if not lbl or (bl and lbl.lower() == bl): continue
+        cx = el.get(\"x\",0) + el.get(\"w\",0)//2; cy = el.get(\"y\",0) + el.get(\"h\",0)//2
+        suggested.append(\"tap \" + repr(lbl) + \" at (\" + str(cx) + \", \" + str(cy) + \")\")
+        cnt += 1
+    suggested = suggested[:10]
+    data[\"context\"] = context; data[\"suggested_actions\"] = suggested
+    print(json.dumps(data, indent=2))
+''').lstrip()
+sys.stdout.write(script)
+" > "$tmp_enrich"
+
+  local py_in enriched py_exit
+  py_in=$(mktemp /tmp/sim_layout_py_XXXXXX.json)
+  printf '%s' "$asm_result" > "$py_in"
+  enriched=$(python3 "$tmp_enrich" "$py_in")
+  py_exit=$?
+  rm -f "$py_in" "$tmp_enrich"
+
+  if [[ $py_exit -ne 0 ]] || [[ -z "$enriched" ]]; then
+    echo "$asm_result"
+  else
+    echo "$enriched"
+  fi
+}
+
 cmd_layout_map() {
+  # Optional per-call flags: --source-timeout <seconds>, --filter <buttons|all>
+  local source_timeout="${LAYOUT_MAP_SOURCE_TIMEOUT:-8}"
+  local layout_filter="all"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --source-timeout) source_timeout="$2"; shift 2 ;;
+      --filter)         layout_filter="$2";  shift 2 ;;
+      *) break ;;
+    esac
+  done
+
   _bootstrap
 
   # ── Fetch WDA source XML ──────────────────────────────────────────────────────
+  # Try /wda/accessibleSource first — pre-pruned accessibility-only tree, faster to serialize.
+  # Fall back to full /source if that fails or returns empty.
   local wda_xml curl_rc
-  wda_xml=$(curl -sf --max-time 8 "http://localhost:${WDA_PORT}/session/${WDA_SESSION}/source" 2>/dev/null); curl_rc=$?; true
+  wda_xml=$(curl -sf --max-time "${source_timeout}" \
+    "http://localhost:${WDA_PORT}/session/${WDA_SESSION}/wda/accessibleSource" 2>/dev/null)
+  curl_rc=$?
+  if [[ $curl_rc -ne 0 ]] || [[ -z "$wda_xml" ]]; then
+    # Fall back to full source
+    wda_xml=$(curl -sf --max-time "${source_timeout}" \
+      "http://localhost:${WDA_PORT}/session/${WDA_SESSION}/source" 2>/dev/null); curl_rc=$?; true
+  fi
 
   if [[ $curl_rc -eq 28 ]]; then
-    # Timeout (exit code 28): WDA is alive but the AX tree is too large to serialize.
-    # Do NOT retry /source — that would hang again. Return a minimal partial layout-map.
-    echo "WARNING: WDA /source timed out (AX tree too large). Returning partial layout-map." >&2
-
-    # Try to get the active (focused) element label — this call is fast (~1s).
-    local active_label
-    active_label=$(curl -sf --max-time 3 \
-      "http://localhost:${WDA_PORT}/session/${WDA_SESSION}/element/active" 2>/dev/null \
-      | python3 -c \
-        "import sys,json; d=json.load(sys.stdin); v=d.get('value',{}); print(v.get('label') or v.get('name') or '')" \
-        2>/dev/null) || true
-    active_label="${active_label:-unknown}"
-
-    local lw lh
-    lw="${SIM_LOGICAL_W:-393}"
-    lh="${SIM_LOGICAL_H:-852}"
-
-    printf '{"screen":{"w":%s,"h":%s},"navigation":{"title":"%s","tabs":[],"back":null},"interactive":[],"text":[],"scroll":{"vertical":false,"horizontal":false,"above_fold":[],"below_fold":[]},"context":"unknown","suggested_actions":[],"_warning":"WDA /source timed out (AX tree too large). Layout data is partial \u2014 use tap by coordinate or tap-element with known labels."}\n' \
-      "$lw" "$lh" "$active_label"
-    return 0
+    # Timeout (exit 28): WDA is alive but the AX tree is too large to serialize.
+    # Fall back to targeted /elements queries — much faster than /source on large trees.
+    echo "WARNING: WDA /source timed out after ${source_timeout}s (AX tree too large). Using element-query fallback." >&2
+    _layout_map_elements_fallback "$layout_filter"
+    return $?
   fi
 
   if [[ $curl_rc -ne 0 ]] || [[ -z "$wda_xml" ]]; then
@@ -2030,7 +2349,16 @@ cmd_layout_map() {
       if [[ -n "$session_id" ]]; then
         WDA_SESSION="$session_id"
         _wda_write_cache
-        wda_xml=$(curl -sf --max-time 8 "http://localhost:${WDA_PORT}/session/${WDA_SESSION}/source" 2>/dev/null) || true
+        # Re-pin active application after session recreate to avoid background-window mismatch on iPad
+        if [[ -n "${WDA_APP_BUNDLE_ID:-}" ]]; then
+          curl -s -X POST \
+            -H "Content-Type: application/json" \
+            -d "{\"settings\":{\"defaultActiveApplication\":\"${WDA_APP_BUNDLE_ID}\"}}" \
+            --max-time 5 \
+            "http://localhost:${WDA_PORT}/session/${WDA_SESSION}/appium/settings" \
+            > /dev/null 2>&1 || true
+        fi
+        wda_xml=$(curl -sf --max-time "${source_timeout}" "http://localhost:${WDA_PORT}/session/${WDA_SESSION}/source" 2>/dev/null) || true
       fi
     fi
     if [[ -z "$wda_xml" ]]; then
@@ -2049,6 +2377,7 @@ import sys, json, xml.etree.ElementTree as ET
 
 logical_w = int(sys.argv[1]) if len(sys.argv) > 1 else 393
 logical_h = int(sys.argv[2]) if len(sys.argv) > 2 else 852
+layout_filter = sys.argv[4] if len(sys.argv) > 4 else "all"
 
 raw = open(sys.argv[3]).read() if len(sys.argv) > 3 else sys.stdin.read()
 # WDA /source returns JSON {"value": "<xml..."} — unwrap if needed
@@ -2085,10 +2414,14 @@ def iter_all(node):
     for child in node:
         yield from iter_all(child)
 
+# ── Single pass over full tree — cache in list so we don't re-traverse for each type ──
+
+all_nodes = list(iter_all(root))
+
 # ── Screen dimensions ──────────────────────────────────────────────────────────
 
 app_el = next(
-    (e for e in iter_all(root) if e.tag == "XCUIElementTypeApplication"),
+    (e for e in all_nodes if e.tag == "XCUIElementTypeApplication"),
     root
 )
 screen_w = iattr(app_el, "width", logical_w)
@@ -2098,13 +2431,13 @@ screen_h = iattr(app_el, "height", logical_h)
 
 is_modal = any(
     e.tag in ("XCUIElementTypeSheet", "XCUIElementTypeAlert")
-    for e in iter_all(root)
+    for e in all_nodes
 )
 
 # ── Tab bar ────────────────────────────────────────────────────────────────────
 
 tab_bar = next(
-    (e for e in iter_all(root) if e.tag == "XCUIElementTypeTabBar"),
+    (e for e in all_nodes if e.tag == "XCUIElementTypeTabBar"),
     None
 )
 
@@ -2130,7 +2463,7 @@ if tab_bar is not None and is_visible(tab_bar):
 # ── Navigation bar ─────────────────────────────────────────────────────────────
 
 nav_bar = next(
-    (e for e in iter_all(root) if e.tag == "XCUIElementTypeNavigationBar"),
+    (e for e in all_nodes if e.tag == "XCUIElementTypeNavigationBar"),
     None
 )
 
@@ -2173,6 +2506,8 @@ INTERACTIVE_TAGS = {
     "XCUIElementTypeSlider",
     "XCUIElementTypeSearchField",
 }
+if layout_filter == "buttons":
+    INTERACTIVE_TAGS = {"XCUIElementTypeButton"}
 
 TAG_TO_ROLE = {
     "XCUIElementTypeButton":          "AXButton",
@@ -2185,7 +2520,7 @@ TAG_TO_ROLE = {
 
 interactive = []
 seen_interactive = set()
-for el in iter_all(root):
+for el in all_nodes:
     if el.tag not in INTERACTIVE_TAGS:
         continue
     if id(el) in tab_bar_elems or id(el) in nav_bar_elems:
@@ -2218,22 +2553,23 @@ headings = []
 texts = []
 seen_text = set()
 
-for el in iter_all(root):
-    if el.tag != "XCUIElementTypeStaticText":
-        continue
-    if not is_visible(el):
-        continue
-    n = name(el)
-    if not n or n in seen_text:
-        continue
-    ey = iattr(el, "y")
-    if ey < content_top or ey > tab_bar_top:
-        continue
-    seen_text.add(n)
-    if ey <= heading_threshold_y and len(headings) < 5:
-        headings.append(n)
-    elif len(texts) < 10:
-        texts.append(n)
+if layout_filter != "buttons":
+    for el in all_nodes:
+        if el.tag != "XCUIElementTypeStaticText":
+            continue
+        if not is_visible(el):
+            continue
+        n = name(el)
+        if not n or n in seen_text:
+            continue
+        ey = iattr(el, "y")
+        if ey < content_top or ey > tab_bar_top:
+            continue
+        seen_text.add(n)
+        if ey <= heading_threshold_y and len(headings) < 5:
+            headings.append(n)
+        elif len(texts) < 10:
+            texts.append(n)
 
 # Remove texts that duplicate headings
 heading_set = set(headings)
@@ -2241,10 +2577,7 @@ texts = [t for t in texts if t not in heading_set][:10]
 
 # ── Scroll awareness ────────────────────────────────────────────────────────────
 
-scroll_views = [
-    e for e in iter_all(root)
-    if e.tag == "XCUIElementTypeScrollView" and is_visible(e)
-]
+scroll_views = [e for e in all_nodes if e.tag == "XCUIElementTypeScrollView" and is_visible(e)]
 has_vertical_scroll = len(scroll_views) > 0
 has_horizontal_scroll = any(
     iattr(sv, "width") > iattr(sv, "height") for sv in scroll_views
@@ -2261,7 +2594,7 @@ FOLD_TAGS = {
     "XCUIElementTypeCell",
 }
 
-for el in iter_all(root):
+for el in all_nodes:
     if el.tag not in FOLD_TAGS:
         continue
     if not is_visible(el):
@@ -2305,7 +2638,7 @@ output = {
 
 print(json.dumps(output))
 PYPARSE
-  result=$(python3 "$tmp_py_parse" "$SIM_LOGICAL_W" "$SIM_LOGICAL_H" "$tmp_xml")
+  result=$(python3 "$tmp_py_parse" "$SIM_LOGICAL_W" "$SIM_LOGICAL_H" "$tmp_xml" "$layout_filter")
   local py_parse_exit=$?
   rm -f "$tmp_xml" "$tmp_py_parse"
   if [[ $py_parse_exit -ne 0 ]] || [[ -z "$result" ]]; then
@@ -2860,12 +3193,17 @@ cmd_screenshot() {
 # Accept UDID env var as a shorthand for --device (e.g. UDID=<udid> bash sim <cmd>)
 [[ -z "$SIM_TARGET_UDID" && -n "${UDID:-}" ]] && SIM_TARGET_UDID="$UDID"
 
-# Parse optional --device flag (in any order) before the command name
+# Parse optional --device and --source-timeout flags (in any order) before the command name
 while true; do
   case "${1:-}" in
     --device)
       [[ $# -ge 2 ]] || die "Usage: sim --device <UDID> <command> [args]"
       SIM_TARGET_UDID="$2"
+      shift 2
+      ;;
+    --source-timeout)
+      [[ $# -ge 2 ]] || die "--source-timeout requires a value in seconds"
+      LAYOUT_MAP_SOURCE_TIMEOUT="$2"
       shift 2
       ;;
     *) break ;;
@@ -2931,7 +3269,8 @@ case "$CMD" in
   wait-for)        cmd_wait_for       "$@"  ;;
   wait-for-stable) cmd_wait_for_stable "$@" ;;
   describe-point)  cmd_describe_point "$@"  ;;
-  layout-map)      cmd_layout_map           ;;
+  layout-map)           cmd_layout_map          "$@"  ;;
+  ensure-foreground-app) cmd_ensure_foreground_app "$@" ;;
   install-skills) cmd_install_skills      ;;
   ""|--help|-h) usage; exit 0           ;;
   *) die "Unknown command: $CMD. Run sim --help for usage." ;;
