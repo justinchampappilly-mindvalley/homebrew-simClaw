@@ -252,6 +252,21 @@ Other useful commands:
 - sim --device <UDID> describe                 — describe visible screen
 - sim --device <UDID> screen-title             — get current screen title
 
+## Login / Authentication screens
+If you encounter a login page, sign-in screen, or any authentication prompt at ANY point
+during navigation, you MUST stop and output this JSON immediately:
+{
+  "scenario": "<SCENARIO_DESCRIPTION>",
+  "device": "<DEVICE_LABEL>",
+  "udid": "<UDID>",
+  "result": "blocked",
+  "note": "Login screen encountered — credentials required",
+  "screenshot": "/tmp/pr<N>-qa-<TIMESTAMP>/<SCENARIO_SLUG>/login_blocked.png"
+}
+Take a screenshot of the login screen BEFORE outputting the JSON.
+Do NOT attempt to guess credentials or skip the login. Do NOT mark as skipped or failed.
+The parent agent will collect your result, ask the user for credentials, and re-run you.
+
 ## CRITICAL PERFORMANCE RULES
 Each Bash tool call costs ~10s API latency. Always batch with &&.
 - BAD:  sim tap-element "Login" / then / sim wait-for "Home" / then / sim screenshot path.png
@@ -276,7 +291,7 @@ Output ONLY this JSON:
   "scenario": "<SCENARIO_DESCRIPTION>",
   "device": "<DEVICE_LABEL>",
   "udid": "<UDID>",
-  "result": "pass|fail|skipped",
+  "result": "pass|fail|skipped|blocked",
   "note": "<one-line observation>",
   "screenshot": "/tmp/pr<N>-qa-<TIMESTAMP>/<SCENARIO_SLUG>/evidence.png"
 }
@@ -285,6 +300,29 @@ Output ONLY this JSON:
 ### Wait for all agents
 
 Wait for task-completion notifications from every spawned agent. Collect all JSON result objects. Do not post the PR comment until every agent has responded.
+
+### Handle login-blocked agents
+
+After all agents return, check if any reported `"result": "blocked"`. If so:
+
+1. Show the user the screenshot(s) from the blocked agent(s).
+2. Ask the user: **"One or more scenarios hit a login screen. Please provide credentials (username and password) to continue, or type 'skip' to mark these scenarios as skipped."**
+3. Wait for the user's response.
+4. If the user provides credentials, re-spawn ONLY the blocked agents with the same scenario prompt but prepend these additional steps before navigation:
+   ```
+   ## Pre-navigation: Log in first
+   The app requires authentication. Before navigating to your test scenario:
+   1. sim --device <UDID> layout-map  — confirm you are on the login screen
+   2. Tap the username/email field, then type the credentials:
+      sim --device <UDID> tap-element "<email_field_label>" && sim --device <UDID> type "<USERNAME>"
+   3. Tap the password field and type the password:
+      sim --device <UDID> tap-element "<password_field_label>" && sim --device <UDID> type "<PASSWORD>"
+   4. Tap the sign-in/login button:
+      sim --device <UDID> tap-and-wait "<login_button_label>"
+   5. Wait for the home/main screen to load before proceeding with your scenario.
+   ```
+5. If the user says "skip", change those agents' results to `"result": "skipped"` with note "Login required — skipped by user".
+6. Wait for re-spawned agents to complete, then proceed to Phase 5.
 
 ---
 
