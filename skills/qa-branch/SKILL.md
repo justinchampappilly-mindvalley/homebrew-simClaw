@@ -225,22 +225,64 @@ REPO="<REPO>"
 Branch: <BRANCH_NAME>
 App already installed and WDA running on port <PORT> — do NOT run setup.
 
+## PRIMARY NAVIGATION METHOD — WDA REST API pointer actions
+
+Use WDA pointer actions as the PRIMARY way to tap. They go through the WDA HTTP server
+(already running on port <PORT>) using iOS logical coordinates — no macOS screen position
+needed, so they work reliably on BOTH iPhone AND iPad simulators.
+
+Get the WDA session ID once at the start and reuse it throughout:
+
+  PORT=<PORT>
+  SESS=$(curl -sf http://localhost:$PORT/status | python3 -c "import sys,json; print(json.load(sys.stdin)['value']['sessionId'])")
+
+Tap at iOS logical coordinate (X, Y):
+
+  curl -sf -X POST http://localhost:$PORT/session/$SESS/actions \
+    -H "Content-Type: application/json" \
+    -d '{"actions":[{"type":"pointer","id":"finger","parameters":{"pointerType":"touch"},"actions":[{"type":"pointerMove","duration":0,"x":X,"y":Y},{"type":"pointerDown","button":0},{"type":"pause","duration":100},{"type":"pointerUp","button":0}]}]}'
+
+Find element coordinates:
+
+  # Search by accessibility label (fast, recommended)
+  EID=$(curl -sf -X POST http://localhost:$PORT/session/$SESS/elements \
+    -H "Content-Type: application/json" \
+    -d '{"using":"accessibility id","value":"<label>"}' | python3 -c \
+    "import sys,json; elems=json.load(sys.stdin)['value']; print(elems[0]['ELEMENT'] if elems else 'NOT_FOUND')")
+
+  # Get rect for the element ID (returns iOS logical coords)
+  curl -sf http://localhost:$PORT/session/$SESS/element/$EID/rect
+  # → {"x":..., "y":..., "width":..., "height":...}
+  # Tap center: x + width/2, y + height/2
+
+## FALLBACK — sim tap (use ONLY if WDA pointer action fails)
+
+"/opt/homebrew/bin/sim --device <UDID> tap <X> <Y>" is a CGEvent-based fallback.
+WARNING: sim tap is UNRELIABLE on iPad simulators — it uses macOS screen coordinates
+which require knowing the simulator window's on-screen position, and breaks when
+multiple simulators are open. Always prefer WDA pointer actions over sim tap.
+
 ## CRITICAL PERFORMANCE RULES
 Each Bash tool call costs ~10s API latency. Always batch with &&.
-- BAD:  sim tap X Y  /  then  /  sim wait-for "X" 10  /  then  /  sim layout-map
-- GOOD: sim tap X Y && sim wait-for "X" 10 && sim layout-map  (one Bash call)
+- BAD:  curl (get SESS) / then / curl (tap) / then / sim screenshot
+- GOOD: SESS=$(curl -sf ...) && curl -sf -X POST ...actions... && sim screenshot  (one call)
 
-After scroll-to-visible: use layout-map to get coords, tap by coordinate — NOT tap-element.
-Tab bar coords: always from layout-map navigation.tabs[].x/y — never hardcode.
+Prefer WDA /elements calls over layout-map for navigation — /elements is fast (< 1s)
+and works even when layout-map hangs (Mindvalley AX tree can timeout WDA /source).
 
-If layout-map returns a _warning (AX tree timeout): use direct WDA API calls to find
-elements — POST /session/<PORT>/elements with {"using":"accessibility id","value":"<label>"},
-GET /element/{id}/rect for coords, then sim --device <UDID> tap <cx> <cy>.
+After locating an element via /elements + /rect: tap using WDA pointer actions at
+center (x + width/2, y + height/2). Do NOT use sim tap-element on iPads.
+
+Tab bar items: find by class name XCUIElementTypeButton, filter response by label.
+
+If layout-map returns a _warning (AX tree timeout): fall back entirely to direct WDA
+/elements calls — POST /session/$SESS/elements, GET /element/{id}/rect for coords,
+then POST /session/$SESS/actions with the pointer action tap pattern above.
 
 ## Steps
 1. mkdir -p /tmp/pr<N>-qa-<TIMESTAMP>/<SCENARIO_SLUG>/
-2. /opt/homebrew/bin/sim --device <UDID> layout-map  — orient yourself
-3. Navigate to the feature under test using batched sim commands
+2. Get WDA session: SESS=$(curl -sf http://localhost:<PORT>/status | python3 -c "import sys,json; print(json.load(sys.stdin)['value']['sessionId'])")
+3. Navigate to the feature under test using WDA pointer actions (primary) or batched sim commands as fallback
 4. Verify the scenario passes or fails
 5. /opt/homebrew/bin/sim --device <UDID> screenshot /tmp/pr<N>-qa-<TIMESTAMP>/<SCENARIO_SLUG>/evidence.png
 6. Output the JSON result below
