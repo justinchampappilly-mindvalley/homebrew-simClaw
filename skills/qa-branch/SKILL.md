@@ -63,13 +63,20 @@ Port allocation:
 XCODEPROJ=$(find . -maxdepth 2 -name "*.xcodeproj" | head -1)
 SCHEME=$(basename "$XCODEPROJ" .xcodeproj)
 APP_NAME="$SCHEME"
+
+# Detect project type — workspace vs project
+if [[ -f "$(find . -maxdepth 2 -name '*.xcworkspace' | head -1)" ]]; then
+  BUILD_FLAG="-workspace $(find . -maxdepth 2 -name '*.xcworkspace' | head -1)"
+else
+  BUILD_FLAG="-project $XCODEPROJ"
+fi
 ```
 
 ### 1e. Scenario derivation
 
 From the PR description and diff, derive:
 1. **Changed UI surfaces** — map file paths to feature names
-2. **Changed libraries** — infer test focus (Nuke→images, Parchment→tabs, Lottie→animations, Apollo→data screens)
+2. **Changed libraries** — map changed dependencies to affected UI surfaces
 3. **Acceptance criteria** — each criterion becomes one scenario
 4. **How to Test steps** — use as navigation instructions
 
@@ -105,19 +112,19 @@ ssh-add --apple-use-keychain ~/.ssh/id_ed25519
 
 ### 2c. Resolve packages (if needed)
 ```bash
-xcodebuild -resolvePackageDependencies -project "$XCODEPROJ" -scheme "$SCHEME" 2>&1 | tail -5
+xcodebuild -resolvePackageDependencies $BUILD_FLAG -scheme "$SCHEME" 2>&1 | tail -5
 ```
 If resolve fails with "already exists in file system":
 ```bash
 DERIVED_DATA=$(find ~/Library/Developer/Xcode/DerivedData -maxdepth 1 -name "${SCHEME}-*" -type d | head -1)
 rm -rf ~/Library/Caches/org.swift.swiftpm/ "$DERIVED_DATA/SourcePackages/"
-xcodebuild -resolvePackageDependencies -project "$XCODEPROJ" -scheme "$SCHEME" 2>&1 | tail -5
+xcodebuild -resolvePackageDependencies $BUILD_FLAG -scheme "$SCHEME" 2>&1 | tail -5
 ```
 
 ### 2d. Build (against the first available iPhone UDID)
 ```bash
 xcodebuild build \
-  -project "$XCODEPROJ" -scheme "$SCHEME" \
+  $BUILD_FLAG -scheme "$SCHEME" \
   -destination "platform=iOS Simulator,id=<IPHONE_UDIDS[0]>" \
   2>&1 | grep -E "error:|BUILD SUCCEEDED|BUILD FAILED" | tail -10
 ```
@@ -129,10 +136,7 @@ If build fails → stop, report to user, do NOT proceed.
 
 ### 3a. Clear all stale sim state
 ```bash
-pkill -f WebDriverAgentRunner 2>/dev/null || true
-sleep 2
-rm -f /tmp/sim_bootstrap_cache_*.json /tmp/sim_queue.fifo /tmp/sim_queue.pid
-echo "Cleared"
+sim cleanup
 ```
 
 ### 3b. Locate app binary
@@ -165,13 +169,13 @@ The sim tool now patches `USE_PORT` into a temp xctestrun copy via PlistBuddy, s
 
 ### 3d. WDA health check — verify every simulator before spawning agents
 ```bash
-# Check all iPhone WDA ports
-curl -sf --max-time 3 http://localhost:8100/status > /dev/null && echo "iPhone[0] OK" || echo "iPhone[0] FAILED"
-curl -sf --max-time 3 http://localhost:8101/status > /dev/null && echo "iPhone[1] OK" || echo "iPhone[1] FAILED"
+# Check all iPhone simulators
+$SIM --device <IPHONE_UDIDS[0]> health-check && echo "iPhone[0] OK" || echo "iPhone[0] FAILED"
+$SIM --device <IPHONE_UDIDS[1]> health-check && echo "iPhone[1] OK" || echo "iPhone[1] FAILED"
 # ... one per simulator
 
-# Check all iPad WDA ports
-curl -sf --max-time 3 http://localhost:8200/status > /dev/null && echo "iPad[0] OK" || echo "iPad[0] FAILED"
+# Check all iPad simulators
+$SIM --device <IPAD_UDIDS[0]> health-check && echo "iPad[0] OK" || echo "iPad[0] FAILED"
 # ...
 ```
 
@@ -225,67 +229,45 @@ REPO="<REPO>"
 Branch: <BRANCH_NAME>
 App already installed and WDA running on port <PORT> — do NOT run setup.
 
-## PRIMARY NAVIGATION METHOD — WDA REST API pointer actions
+## Navigation
+Use sim commands for all interactions. sim tap now uses WDA pointer actions
+internally — it works reliably on both iPhone and iPad. No need for raw curl.
 
-Use WDA pointer actions as the PRIMARY way to tap. They go through the WDA HTTP server
-(already running on port <PORT>) using iOS logical coordinates — no macOS screen position
-needed, so they work reliably on BOTH iPhone AND iPad simulators.
+Primary workflow:
+1. sim --device <UDID> layout-map     — see what's on screen
+2. sim --device <UDID> tap-and-wait "<label>" — tap + wait + get new layout-map
+3. sim --device <UDID> screenshot <path>      — capture evidence
 
-Get the WDA session ID once at the start and reuse it throughout:
+If tap-and-wait fails, try direct coordinates:
+1. sim --device <UDID> find-element "<label>"  — get element coordinates
+2. sim --device <UDID> tap <x> <y>             — tap at coordinates
+3. sim --device <UDID> wait-for "<label>"      — wait for expected element
 
-  PORT=<PORT>
-  SESS=$(curl -sf http://localhost:$PORT/status | python3 -c "import sys,json; print(json.load(sys.stdin)['value']['sessionId'])")
-
-Tap at iOS logical coordinate (X, Y):
-
-  curl -sf -X POST http://localhost:$PORT/session/$SESS/actions \
-    -H "Content-Type: application/json" \
-    -d '{"actions":[{"type":"pointer","id":"finger","parameters":{"pointerType":"touch"},"actions":[{"type":"pointerMove","duration":0,"x":X,"y":Y},{"type":"pointerDown","button":0},{"type":"pause","duration":100},{"type":"pointerUp","button":0}]}]}'
-
-Find element coordinates:
-
-  # Search by accessibility label (fast, recommended)
-  EID=$(curl -sf -X POST http://localhost:$PORT/session/$SESS/elements \
-    -H "Content-Type: application/json" \
-    -d '{"using":"accessibility id","value":"<label>"}' | python3 -c \
-    "import sys,json; elems=json.load(sys.stdin)['value']; print(elems[0]['ELEMENT'] if elems else 'NOT_FOUND')")
-
-  # Get rect for the element ID (returns iOS logical coords)
-  curl -sf http://localhost:$PORT/session/$SESS/element/$EID/rect
-  # → {"x":..., "y":..., "width":..., "height":...}
-  # Tap center: x + width/2, y + height/2
-
-## FALLBACK — sim tap (use ONLY if WDA pointer action fails)
-
-"/opt/homebrew/bin/sim --device <UDID> tap <X> <Y>" is a CGEvent-based fallback.
-WARNING: sim tap is UNRELIABLE on iPad simulators — it uses macOS screen coordinates
-which require knowing the simulator window's on-screen position, and breaks when
-multiple simulators are open. Always prefer WDA pointer actions over sim tap.
+Other useful commands:
+- sim --device <UDID> tap-element "<label>"    — tap by accessibility label
+- sim --device <UDID> scroll-to-visible "<label>" — scroll until element visible
+- sim --device <UDID> scroll-down / scroll-up  — manual scroll
+- sim --device <UDID> type "<text>"            — type into focused field
+- sim --device <UDID> wait-for-stable          — wait for screen to stabilize
+- sim --device <UDID> describe                 — describe visible screen
+- sim --device <UDID> screen-title             — get current screen title
 
 ## CRITICAL PERFORMANCE RULES
 Each Bash tool call costs ~10s API latency. Always batch with &&.
-- BAD:  curl (get SESS) / then / curl (tap) / then / sim screenshot
-- GOOD: SESS=$(curl -sf ...) && curl -sf -X POST ...actions... && sim screenshot  (one call)
+- BAD:  sim tap-element "Login" / then / sim wait-for "Home" / then / sim screenshot path.png
+- GOOD: sim tap-element "Login" && sim wait-for "Home" 10 && sim screenshot path.png  (one call)
 
-Prefer WDA /elements calls over layout-map for navigation — /elements is fast (< 1s)
-and works even when layout-map hangs (Mindvalley AX tree can timeout WDA /source).
-
-After locating an element via /elements + /rect: tap using WDA pointer actions at
-center (x + width/2, y + height/2). Do NOT use sim tap-element on iPads.
-
-Tab bar items: find by class name XCUIElementTypeButton, filter response by label.
-
-If layout-map returns a _warning (AX tree timeout): fall back entirely to direct WDA
-/elements calls — POST /session/$SESS/elements, GET /element/{id}/rect for coords,
-then POST /session/$SESS/actions with the pointer action tap pattern above.
+Use sim tap-and-wait when possible — it does tap + wait + layout-map in ONE call.
+layout-map has a built-in fallback for AX tree timeouts — no manual recovery needed.
 
 ## Steps
 1. mkdir -p /tmp/pr<N>-qa-<TIMESTAMP>/<SCENARIO_SLUG>/
-2. Get WDA session: SESS=$(curl -sf http://localhost:<PORT>/status | python3 -c "import sys,json; print(json.load(sys.stdin)['value']['sessionId'])")
-3. Navigate to the feature under test using WDA pointer actions (primary) or batched sim commands as fallback
-4. Verify the scenario passes or fails
-5. /opt/homebrew/bin/sim --device <UDID> screenshot /tmp/pr<N>-qa-<TIMESTAMP>/<SCENARIO_SLUG>/evidence.png
-6. Output the JSON result below
+2. sim --device <UDID> health-check  — verify WDA is alive
+3. sim --device <UDID> layout-map    — orient yourself
+4. Navigate to the feature under test using sim commands (tap-and-wait, tap-element, etc.)
+5. Verify the scenario passes or fails
+6. sim --device <UDID> screenshot /tmp/pr<N>-qa-<TIMESTAMP>/<SCENARIO_SLUG>/evidence.png
+7. Output the JSON result below
 
 ## Output format
 IMPORTANT: Do NOT post a PR comment. Do NOT call gh pr comment.
@@ -308,10 +290,18 @@ Wait for task-completion notifications from every spawned agent. Collect all JSO
 
 ## Phase 5 — Aggregate & Post PR Comment
 
-Upload all screenshots:
+Upload all screenshots. Use a project-specific upload script if available, otherwise attach via `gh` CLI:
 ```bash
-python3 /Users/justin/Mobile_iOS_Mindvalley/Scripts/github_upload_image.py <image_path>
+# Upload screenshots — use project upload script if available, else gh CLI
+if [[ -x "./Scripts/github_upload_image.py" ]]; then
+  python3 ./Scripts/github_upload_image.py <image_path>
+elif command -v gh &>/dev/null; then
+  # Attach screenshot as a PR comment image (user-attachments)
+  echo "![screenshot](<local_path>)"
+fi
 ```
+
+Note: Screenshot upload to GitHub CDN is project-specific. If neither method works, reference screenshots by local path in the PR comment and note they are available locally.
 
 Post one unified comment:
 ```bash
@@ -383,10 +373,8 @@ osascript -e 'display notification "QA complete — PR #<N> comment posted" with
 | Failure | Action |
 |---|---|
 | Build fails after retry | Stop, report errors, do NOT test |
-| `sim: command not found` | Use `/opt/homebrew/bin/sim` — never `~/.claude/utils/` |
 | WDA fails to start for one simulator | Skip that scenario, mark ⚠ Skipped, continue with others |
 | All iPhone WDA fail | Stop entirely — cannot QA without iPhone |
 | layout-map returns `{"error":"WDA unavailable"}` | WDA fully down — agent should try wda-start or mark ⚠ Skipped |
-| layout-map returns `_warning` (AX timeout) | Use direct WDA /elements API to navigate |
 | Not enough simulators for scenario count | Reuse same UDID for multiple scenarios (agents run sequentially on shared UDID then) |
 | Agent returns no JSON | Mark that scenario ⚠ Skipped (agent failure), note in comment |

@@ -680,6 +680,50 @@ _swipe_cgevent() {
   _wda_swipe "$lx1" "$ly1" "$lx2" "$ly2" "$duration_ms"
 }
 
+# _tap_wda <x> <y>
+# Non-fatal WDA tap — returns 1 on failure instead of die-ing.
+# Used by cmd_tap for graceful fallback to _tap_cgevent.
+_tap_wda() {
+  local x="$1" y="$2"
+  # Ensure we have a WDA session
+  _bootstrap || return 1
+
+  local resp rc=0
+  resp=$(curl -sf -X POST \
+    -H "Content-Type: application/json" \
+    -d "{\"actions\":[{\"type\":\"pointer\",\"id\":\"finger\",\"parameters\":{\"pointerType\":\"touch\"},\"actions\":[{\"type\":\"pointerMove\",\"duration\":0,\"x\":${x},\"y\":${y}},{\"type\":\"pointerDown\",\"button\":0},{\"type\":\"pause\",\"duration\":100},{\"type\":\"pointerUp\",\"button\":0}]}]}" \
+    --max-time 10 \
+    "http://localhost:${WDA_PORT}/session/${WDA_SESSION}/actions" 2>/dev/null) || rc=$?
+
+  if [[ $rc -ne 0 ]]; then
+    return 1
+  fi
+
+  # Check for WDA error response
+  local status
+  status=$(echo "$resp" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('status', d.get('value',{}).get('error','')))" 2>/dev/null) || true
+  if [[ -n "$status" ]] && [[ "$status" != "0" ]] && [[ "$status" != "" ]] && [[ "$status" != "None" ]]; then
+    return 1
+  fi
+
+  return 0
+}
+
+# _swipe_wda <x1> <y1> <x2> <y2> [duration_ms=800]
+# Non-fatal WDA swipe — returns 1 on failure instead of die-ing.
+# Used by cmd_swipe for graceful fallback to _swipe_cgevent.
+_swipe_wda() {
+  local x1="$1" y1="$2" x2="$3" y2="$4" duration="${5:-800}"
+  _bootstrap || return 1
+
+  curl -sf -X POST \
+    -H "Content-Type: application/json" \
+    -d "{\"actions\":[{\"type\":\"pointer\",\"id\":\"finger\",\"parameters\":{\"pointerType\":\"touch\"},\"actions\":[{\"type\":\"pointerMove\",\"duration\":0,\"x\":${x1},\"y\":${y1}},{\"type\":\"pointerDown\",\"button\":0},{\"type\":\"pointerMove\",\"duration\":${duration},\"x\":${x2},\"y\":${y2}},{\"type\":\"pointerUp\",\"button\":0}]}]}" \
+    --max-time 15 \
+    "http://localhost:${WDA_PORT}/session/${WDA_SESSION}/actions" \
+    > /dev/null 2>&1 || return 1
+}
+
 # _wda_type <text>
 # Sets text in the currently focused/active element via WDA's setValue endpoint.
 # This goes through the proper iOS input path (unlike the AX direct-value approach).
@@ -1253,11 +1297,24 @@ cmd_status() {
 }
 
 cmd_tap() {
-  [[ $# -ge 2 ]] || die "Usage: sim tap <x> <y>"
-  _is_integer "$1" || die "tap: x must be an integer, got: $1"
-  _is_integer "$2" || die "tap: y must be an integer, got: $2"
+  local x="${1:?Usage: sim tap <x> <y>}"
+  local y="${2:?Usage: sim tap <x> <y>}"
+  _is_integer "$x" || die "tap: x must be an integer, got: $x"
+  _is_integer "$y" || die "tap: y must be an integer, got: $y"
+
+  # Try WDA pointer action first — works reliably on all devices
+  if _tap_wda "$x" "$y" 2>/dev/null; then
+    return 0
+  fi
+
+  # Fallback: CGEvent injection (requires simulator window position)
+  echo "WDA tap unavailable, falling back to CGEvent injection..." >&2
   _bootstrap
-  _wda_tap "$1" "$2"
+  local screen_coords sx sy
+  screen_coords=$(_ios_to_screen "$x" "$y")
+  sx=$(echo "$screen_coords" | awk '{print $1}')
+  sy=$(echo "$screen_coords" | awk '{print $2}')
+  _tap_cgevent "$sx" "$sy"
 }
 
 cmd_tap_element() {
@@ -1441,11 +1498,26 @@ cmd_swipe() {
   _is_integer "$2" || die "swipe: y1 must be an integer, got: $2"
   _is_integer "$3" || die "swipe: x2 must be an integer, got: $3"
   _is_integer "$4" || die "swipe: y2 must be an integer, got: $4"
-  _bootstrap
   local steps="${5:-25}"
   local step_ms="${6:-20}"
   local duration_ms=$(( steps * step_ms ))
-  _wda_swipe "$1" "$2" "$3" "$4" "$duration_ms"
+
+  # Try WDA pointer action first — works reliably on all devices
+  if _swipe_wda "$1" "$2" "$3" "$4" "$duration_ms" 2>/dev/null; then
+    return 0
+  fi
+
+  # Fallback: legacy CGEvent-style injection (macOS coord round-trip)
+  echo "WDA swipe unavailable, falling back to CGEvent injection..." >&2
+  _bootstrap
+  local sc1 sc2 sx1 sy1 sx2 sy2
+  sc1=$(_ios_to_screen "$1" "$2")
+  sx1=$(echo "$sc1" | awk '{print $1}')
+  sy1=$(echo "$sc1" | awk '{print $2}')
+  sc2=$(_ios_to_screen "$3" "$4")
+  sx2=$(echo "$sc2" | awk '{print $1}')
+  sy2=$(echo "$sc2" | awk '{print $2}')
+  _swipe_cgevent "$sx1" "$sy1" "$sx2" "$sy2" "$steps" "$step_ms"
 }
 
 cmd_scroll_up() {
@@ -3250,6 +3322,38 @@ cmd_install_skills() {
   echo "$installed skill(s) installed. Available in any Claude Code session immediately."
 }
 
+# ── Housekeeping Commands ───────────────────────────────────────────────────
+
+cmd_cleanup() {
+  echo "Cleaning up stale sim state..."
+  # Kill any stale WDA processes
+  pkill -f WebDriverAgentRunner 2>/dev/null || true
+  sleep 1
+  # Remove bootstrap caches
+  rm -f /tmp/sim_bootstrap_cache_*.json
+  # Remove queue artifacts
+  rm -f /tmp/sim_queue.fifo /tmp/sim_queue.pid
+  echo "Cleanup complete"
+}
+
+cmd_wda_session() {
+  _bootstrap
+  echo "$WDA_SESSION"
+}
+
+cmd_health_check() {
+  _bootstrap
+  local resp rc=0
+  resp=$(curl -sf --max-time 5 "http://localhost:${WDA_PORT}/status" 2>/dev/null) || rc=$?
+  if [[ $rc -eq 0 ]] && [[ -n "$resp" ]]; then
+    echo "OK — WDA responding on port ${WDA_PORT}"
+    echo "$resp" | python3 -c "import sys,json; d=json.load(sys.stdin).get('value',{}); print(f'  Session: {d.get(\"sessionId\",\"unknown\")}')" 2>/dev/null || true
+  else
+    echo "FAILED — WDA not responding on port ${WDA_PORT}" >&2
+    return 1
+  fi
+}
+
 case "$CMD" in
   status)       cmd_status                ;;
   setup)        cmd_setup        "$@"    ;;
@@ -3272,6 +3376,9 @@ case "$CMD" in
   layout-map)           cmd_layout_map          "$@"  ;;
   ensure-foreground-app) cmd_ensure_foreground_app "$@" ;;
   install-skills) cmd_install_skills      ;;
+  cleanup)      cmd_cleanup              ;;
+  wda-session)  cmd_wda_session          ;;
+  health-check) cmd_health_check         ;;
   ""|--help|-h) usage; exit 0           ;;
   *) die "Unknown command: $CMD. Run sim --help for usage." ;;
 esac
