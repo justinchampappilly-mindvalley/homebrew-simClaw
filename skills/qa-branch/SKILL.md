@@ -14,9 +14,28 @@ End-to-end QA testing of a GitHub PR. The parent sets up one simulator per scena
 
 ---
 
-## Phase 0 — Gather Inputs
+## Phase 0 — Prerequisites & Gather Inputs
 
-**Required:** Extract the PR number from the user's message. If not provided, ask for it.
+### 0a. Verify `sim` tool is installed
+
+```bash
+SIM=$(which sim)
+echo "SIM=$SIM"
+```
+
+If `which sim` fails (exit code 1 / empty output), **stop and tell the user:**
+
+> "`sim` (simClaw) is required for QA testing but is not installed. Install it with:
+> ```
+> brew install simclaw
+> ```
+> Then re-run this skill."
+
+Do NOT proceed without `sim`. All simulator interaction (tap, navigate, screenshot, layout-map) depends on it.
+
+### 0b. Gather inputs
+
+**Required:** Extract the PR number from the user's message. If not provided, and we are on a feature branch, use the current branch. If neither is available, ask for it.
 
 **Ask the user one question before proceeding:**
 
@@ -45,14 +64,19 @@ gh pr view <PR_NUMBER> --repo "$REPO" --json files --jq '.files[].path'
 
 ### 1c. Discover available simulators
 ```bash
-# List all available iPhones and iPads
+# List all available iPhones and iPads, grouping by iOS version
 xcrun simctl list devices available | grep -E "iPhone [0-9]+" | head -10
 xcrun simctl list devices available | grep -E "iPad" | head -10
+
+# Also identify which iOS runtimes are available
+xcrun simctl list runtimes available | grep -i ios
 ```
 
 Collect UDIDs into two lists:
 - `IPHONE_UDIDS[]` — one per iPhone scenario needed (use different iPhone models if available; reuse same model with different UDIDs if not)
 - `IPAD_UDIDS[]` — one per iPad scenario needed (only if `IPAD_NEEDED=true`)
+
+**Multi-OS testing:** If the user requests testing on multiple iOS versions (e.g., iOS 18 AND iOS 26), allocate one simulator per iOS version per scenario. Each iOS version × scenario combination gets its own agent.
 
 Port allocation:
 - iPhones: `8100`, `8101`, `8102`, ... (one per iPhone scenario)
@@ -141,47 +165,34 @@ sim cleanup
 
 ### 3b. Locate app binary
 ```bash
-SIM="/opt/homebrew/bin/sim"
+# $SIM was resolved in Phase 0a
 APP_PATH=$(find ~/Library/Developer/Xcode/DerivedData -maxdepth 5 \
   -name "${APP_NAME}.app" -path "*/Debug-iphonesimulator/*" | head -1)
 echo "App: $APP_PATH"
 ```
 
-### 3c. Setup one simulator per scenario (sequential to avoid WDA port collisions)
+### 3c. Setup all simulators (sequential to avoid WDA port collisions)
 
-Run `sim setup` for each simulator in order. Each call blocks until WDA is ready.
+Run `sim setup` for each simulator. The sim tool now handles WDA failure gracefully — if WDA can't start (e.g., iOS 18 with SDK mismatch), setup still completes (boot + install + launch) and reports `WDA: unavailable` instead of failing. Parse the output to determine WDA status per simulator.
 
 ```bash
-# iPhone simulators — one per iPhone scenario
-$SIM --device <IPHONE_UDIDS[0]> setup "$APP_PATH" --port 8100
-$SIM --device <IPHONE_UDIDS[1]> setup "$APP_PATH" --port 8101
-$SIM --device <IPHONE_UDIDS[2]> setup "$APP_PATH" --port 8102
-# ... repeat for each iPhone scenario
-
-# iPad simulators — one per iPad scenario (if IPAD_NEEDED)
-$SIM --device <IPAD_UDIDS[0]> setup "$APP_PATH" --port 8200
-$SIM --device <IPAD_UDIDS[1]> setup "$APP_PATH" --port 8201
-$SIM --device <IPAD_UDIDS[2]> setup "$APP_PATH" --port 8202
-# ... repeat for each iPad scenario
+# Run setup for each simulator — capture output to determine WDA status
+for i in "${!ALL_UDIDS[@]}"; do
+  UDID="${ALL_UDIDS[$i]}"
+  PORT="${ALL_PORTS[$i]}"
+  OUTPUT=$($SIM --device "$UDID" setup "$APP_PATH" --port "$PORT" 2>&1)
+  echo "$OUTPUT"
+  if echo "$OUTPUT" | grep -q "WDA:.*ready"; then
+    WDA_STATUS[$i]="true"
+  else
+    WDA_STATUS[$i]="false"
+  fi
+done
 ```
 
-The sim tool now patches `USE_PORT` into a temp xctestrun copy via PlistBuddy, so each simulator binds to its own unique port.
+**No separate health-check phase needed** — `sim setup` now reports WDA status directly. Pass `WDA_AVAILABLE=true|false` to each scenario agent based on the setup output.
 
-### 3d. WDA health check — verify every simulator before spawning agents
-```bash
-# Check all iPhone simulators
-$SIM --device <IPHONE_UDIDS[0]> health-check && echo "iPhone[0] OK" || echo "iPhone[0] FAILED"
-$SIM --device <IPHONE_UDIDS[1]> health-check && echo "iPhone[1] OK" || echo "iPhone[1] FAILED"
-# ... one per simulator
-
-# Check all iPad simulators
-$SIM --device <IPAD_UDIDS[0]> health-check && echo "iPad[0] OK" || echo "iPad[0] FAILED"
-# ...
-```
-
-- Any iPhone WDA FAILED → skip that scenario, mark ⚠ Skipped in PR comment
-- All iPhone WDA FAILED → stop entirely
-- Any iPad WDA FAILED → skip that iPad scenario, mark ⚠ Skipped
+**WDA failure is NOT a reason to skip a simulator.** The scenario agent receives `WDA_AVAILABLE=false` and uses screenshot-based verification with AX fallback commands instead.
 
 ---
 
@@ -223,34 +234,75 @@ Screenshots dir: /tmp/pr<N>-qa-<TIMESTAMP>/<SCENARIO_SLUG>/
 (create it: mkdir -p /tmp/pr<N>-qa-<TIMESTAMP>/<SCENARIO_SLUG>/)
 
 ## Project constants
-SIM="/opt/homebrew/bin/sim"
+SIM="<SIM_PATH>"   # resolved path to sim tool (from Phase 0a)
 BUNDLE_ID="<BUNDLE_ID>"
 REPO="<REPO>"
 Branch: <BRANCH_NAME>
-App already installed and WDA running on port <PORT> — do NOT run setup.
+WDA_AVAILABLE=<true|false>  # whether WDA is running on this simulator
+App already installed on this simulator — do NOT run setup.
 
 ## Navigation
-Use sim commands for all interactions. sim tap now uses WDA pointer actions
-internally — it works reliably on both iPhone and iPad. No need for raw curl.
+
+### If WDA_AVAILABLE=true
+Use sim commands for all interactions. sim tap uses WDA pointer actions internally.
 
 Primary workflow:
-1. sim --device <UDID> layout-map     — see what's on screen
-2. sim --device <UDID> tap-and-wait "<label>" — tap + wait + get new layout-map
-3. sim --device <UDID> screenshot <path>      — capture evidence
+1. $SIM --device <UDID> layout-map     — see what's on screen
+2. $SIM --device <UDID> tap-and-wait "<label>" — tap + wait + get new layout-map
+3. $SIM --device <UDID> screenshot <path>      — capture evidence
 
 If tap-and-wait fails, try direct coordinates:
-1. sim --device <UDID> find-element "<label>"  — get element coordinates
-2. sim --device <UDID> tap <x> <y>             — tap at coordinates
-3. sim --device <UDID> wait-for "<label>"      — wait for expected element
+1. $SIM --device <UDID> find-element "<label>"  — get element coordinates
+2. $SIM --device <UDID> tap <x> <y>             — tap at coordinates
+3. $SIM --device <UDID> wait-for "<label>"      — wait for expected element
 
 Other useful commands:
-- sim --device <UDID> tap-element "<label>"    — tap by accessibility label
-- sim --device <UDID> scroll-to-visible "<label>" — scroll until element visible
-- sim --device <UDID> scroll-down / scroll-up  — manual scroll
-- sim --device <UDID> type "<text>"            — type into focused field
-- sim --device <UDID> wait-for-stable          — wait for screen to stabilize
-- sim --device <UDID> describe                 — describe visible screen
-- sim --device <UDID> screen-title             — get current screen title
+- $SIM --device <UDID> tap-element "<label>"    — tap by accessibility label
+- $SIM --device <UDID> scroll-to-visible "<label>" — scroll until element visible
+- $SIM --device <UDID> scroll-down / scroll-up  — manual scroll
+- $SIM --device <UDID> type "<text>"            — type into focused field
+- $SIM --device <UDID> wait-for-stable          — wait for screen to stabilize
+- $SIM --device <UDID> describe                 — describe visible screen
+- $SIM --device <UDID> screen-title             — get current screen title
+
+### If WDA_AVAILABLE=false (degraded mode — e.g. older iOS where WDA SDK is incompatible)
+WDA is NOT running. You can still take screenshots and do limited verification:
+1. `xcrun simctl io <UDID> screenshot <path>` — take screenshots
+2. `$SIM --device <UDID> wait-for "<label>"` — AX-based element detection (works without WDA)
+3. `$SIM --device <UDID> describe` — AX-based screen description (works without WDA)
+4. `$SIM --device <UDID> describe-point <x> <y>` — hit-test AX element at coordinate
+
+For navigation without WDA, use CGEvent tapping via a compiled Swift helper:
+1. First, compile the tap helper (if not already at /tmp/simtap):
+   ```bash
+   if [[ ! -x /tmp/simtap ]]; then
+     cat > /tmp/simtap.swift << 'SWIFT'
+   import Cocoa
+   let x = CGFloat(Double(CommandLine.arguments[1])!)
+   let y = CGFloat(Double(CommandLine.arguments[2])!)
+   let p = CGPoint(x: x, y: y)
+   CGEvent(mouseEventSource: nil, mouseType: .mouseMoved, mouseCursorPosition: p, mouseButton: .left)?.post(tap: .cghidEventTap)
+   CGEvent(mouseEventSource: nil, mouseType: .leftMouseDown, mouseCursorPosition: p, mouseButton: .left)?.post(tap: .cghidEventTap)
+   Thread.sleep(forTimeInterval: 0.05)
+   CGEvent(mouseEventSource: nil, mouseType: .leftMouseUp, mouseCursorPosition: p, mouseButton: .left)?.post(tap: .cghidEventTap)
+   SWIFT
+     xcrun swiftc -o /tmp/simtap /tmp/simtap.swift
+   fi
+   ```
+2. Use AX probing to find macOS screen coordinates of interactive elements:
+   ```bash
+   # Compile an AX probe to find element positions (outputs JSON with macOS coords)
+   # Use describe-point to hit-test at specific coordinates
+   $SIM --device <UDID> describe-point <estimated_x> <estimated_y>
+   ```
+3. Activate the correct simulator window, then tap:
+   ```bash
+   osascript -e 'tell application "System Events" to tell process "Simulator" to perform action "AXRaise" of (first window whose name contains "<DEVICE_NAME>")'
+   sleep 0.3
+   /tmp/simtap <macOS_x> <macOS_y>
+   ```
+
+In degraded mode, focus on screenshot-based visual verification. If navigation is too difficult, take a screenshot of the landing screen and report what you can observe.
 
 ## Login / Authentication screens
 If you encounter a login page, sign-in screen, or any authentication prompt at ANY point
@@ -267,13 +319,28 @@ Take a screenshot of the login screen BEFORE outputting the JSON.
 Do NOT attempt to guess credentials or skip the login. Do NOT mark as skipped or failed.
 The parent agent will collect your result, ask the user for credentials, and re-run you.
 
-## CRITICAL PERFORMANCE RULES
+## CRITICAL RULES
+
+### Do NOT troubleshoot WDA
+If WDA_AVAILABLE=false, accept it. Do NOT attempt to:
+- Start WDA yourself (curl, xcodebuild, wda-start)
+- Patch WDA binaries or xctestrun files
+- Create WDA sessions manually
+- Fix bootstrap cache files
+WDA setup was already handled by the parent orchestrator. If it failed, it's because the
+iOS version is incompatible. Use the degraded-mode fallback commands listed above.
+
+### Performance — batch commands
 Each Bash tool call costs ~10s API latency. Always batch with &&.
 - BAD:  sim tap-element "Login" / then / sim wait-for "Home" / then / sim screenshot path.png
 - GOOD: sim tap-element "Login" && sim wait-for "Home" 10 && sim screenshot path.png  (one call)
 
 Use sim tap-and-wait when possible — it does tap + wait + layout-map in ONE call.
 layout-map has a built-in fallback for AX tree timeouts — no manual recovery needed.
+
+### Stay focused
+You have ONE job: verify your scenario and report pass/fail with a screenshot.
+Do not explore unrelated screens, fix infrastructure, or exceed 15 Bash tool calls total.
 
 ## Steps
 1. mkdir -p /tmp/pr<N>-qa-<TIMESTAMP>/<SCENARIO_SLUG>/
@@ -397,6 +464,7 @@ osascript -e 'display notification "QA complete — PR #<N> comment posted" with
 
 ## Key Constants
 
+- **sim tool:** `SIM=$(which sim)` — resolved in Phase 0a; all sim commands use `$SIM`
 - **Repo:** `REPO=$(gh repo view --json nameWithOwner --jq '.nameWithOwner')`
 - **Project:** `XCODEPROJ=$(find . -maxdepth 2 -name "*.xcodeproj" | head -1)`
 - **Scheme:** `SCHEME=$(basename "$XCODEPROJ" .xcodeproj)`

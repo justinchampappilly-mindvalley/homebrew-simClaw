@@ -1075,6 +1075,84 @@ _wda_ensure() {
 
 # cmd_wda_start [port]
 #
+# _wda_patch_ios_compat <products_dir>
+#
+# Makes a WDA build (compiled with iOS 26+ SDK) backward-compatible with older
+# iOS simulator runtimes (e.g. iOS 18). Two problems are fixed:
+#
+# 1. WebDriverAgentLib links _LocationEssentials.framework, which only exists in
+#    iOS 26+ runtimes. Fix: redirect the load to CoreLocation.framework (which
+#    exports the same symbols on all iOS versions) via install_name_tool -change.
+#
+# 2. WDA binaries have LC_BUILD_VERSION minos=26.x, causing xcodebuild to reject
+#    them for older simulators. Fix: patch minos to 13.0 via xcrun vtool.
+#
+# Both patches are idempotent and preserve iOS 26 compatibility.
+# Runs automatically after WDA is built in cmd_setup.
+_wda_patch_ios_compat() {
+  local products_dir="$1"
+  local runner_app="$products_dir/Debug-iphonesimulator/WebDriverAgentRunner-Runner.app"
+  [[ -d "$runner_app" ]] || return 0
+
+  # Collect all WDA binaries that need patching
+  local -a bins=()
+  while IFS= read -r f; do
+    bins+=("$f")
+  done < <(find "$products_dir/Debug-iphonesimulator" \
+    \( -name "WebDriverAgentLib" -o -name "WebDriverAgentRunner" -o -name "WebDriverAgentRunner-Runner" \) \
+    -not -path "*/_CodeSignature/*" -type f 2>/dev/null)
+
+  [[ ${#bins[@]} -gt 0 ]] || return 0
+
+  local did_patch=false
+
+  for bin in "${bins[@]}"; do
+    local short
+    short=$(echo "$bin" | sed "s|.*/Debug-iphonesimulator/||")
+
+    # --- Redirect _LocationEssentials → CoreLocation ---
+    if otool -L "$bin" 2>/dev/null | grep -q "_LocationEssentials"; then
+      install_name_tool -change \
+        "/System/Library/Frameworks/_LocationEssentials.framework/_LocationEssentials" \
+        "/System/Library/Frameworks/CoreLocation.framework/CoreLocation" \
+        "$bin" 2>/dev/null
+      echo "    $short: redirected _LocationEssentials -> CoreLocation"
+      did_patch=true
+    fi
+
+    # --- Patch minos to 13.0 (keep sdk unchanged) ---
+    local current_minos
+    current_minos=$(xcrun vtool -show-build "$bin" 2>/dev/null \
+      | awk '/minos/{print $2}' | head -1) || true
+    if [[ -n "$current_minos" && "$current_minos" != "13.0" ]]; then
+      local current_sdk
+      current_sdk=$(xcrun vtool -show-build "$bin" 2>/dev/null \
+        | awk '/sdk/{print $2}' | head -1) || true
+      xcrun vtool -set-build-version 7 13.0 "${current_sdk:-26.2}" \
+        -replace -output "${bin}.patched" "$bin" 2>/dev/null
+      mv "${bin}.patched" "$bin"
+      echo "    $short: minos $current_minos -> 13.0"
+      did_patch=true
+    fi
+  done
+
+  if [[ "$did_patch" == "true" ]]; then
+    # Re-sign all modified bundles (inner to outer)
+    local top_wdalib="$products_dir/Debug-iphonesimulator/WebDriverAgentLib.framework"
+    local xctest_dir="$runner_app/PlugIns/WebDriverAgentRunner.xctest"
+    local inner_wdalib="$xctest_dir/Frameworks/WebDriverAgentLib.framework"
+    [[ -d "$top_wdalib" ]]   && codesign --force --sign - "$top_wdalib"   2>/dev/null || true
+    [[ -d "$inner_wdalib" ]] && codesign --force --sign - "$inner_wdalib" 2>/dev/null || true
+    [[ -d "$xctest_dir" ]]   && codesign --force --sign - "$xctest_dir"   2>/dev/null || true
+    [[ -d "$runner_app" ]]   && codesign --force --sign - "$runner_app"   2>/dev/null || true
+    echo "    Re-signed all WDA bundles."
+  else
+    echo "    WDA binaries already compatible — no patch needed."
+  fi
+}
+
+# cmd_wda_start [port]
+#
 # WebDriverAgent (WDA) is an Apple XCUITest-based HTTP server that runs inside
 # the iOS Simulator. It exposes a W3C WebDriver-compatible REST API for touch
 # injection, app control, and other automation primitives. All tap and swipe
@@ -3199,6 +3277,12 @@ cmd_setup() {
     [[ -d "$wda_runner" ]] \
       || die "setup: WDA build completed but runner app not found at $wda_runner"
     echo "    WDA build complete."
+
+    # Patch WebDriverAgentLib to weak-link _LocationEssentials so WDA works on
+    # older iOS versions (< 26) where that framework does not exist. Without this
+    # patch, dyld crashes on launch because _LocationEssentials is a hard dependency
+    # introduced when CoreLocation is compiled against the iOS 26+ SDK.
+    _wda_patch_ios_compat "$wda_derived"
   fi
 
   # ── Step 3: Install app (if a .app path was given) ──────────────────────────
@@ -3224,10 +3308,31 @@ cmd_setup() {
     echo "    Bundle ID provided directly ($bundle_id) — skipping install."
   fi
 
-  # ── Step 4: Start WDA ────────────────────────────────────────────────────────
+  # ── Step 4: Start WDA (graceful — setup continues if WDA fails) ─────────────
 
   echo "==> [4/5] Starting WDA on port $wda_port..."
-  cmd_wda_start "$wda_port"
+  local wda_available="true"
+  # Run cmd_wda_start in a subshell so its internal `die` (exit 1) does not
+  # kill the parent setup process. WDA is expected to fail on older iOS
+  # versions where the WDA xctest binary's MinimumOSVersion exceeds the
+  # simulator's OS version (e.g. WDA built with iOS 26 SDK on an iOS 18 sim).
+  if ( cmd_wda_start "$wda_port" ); then
+    # cmd_wda_start wrote port+session to the bootstrap cache — read them back
+    # into the parent shell (subshell variables don't propagate).
+    local cache_file="/tmp/sim_bootstrap_cache_${SIM_UDID}.json"
+    if [[ -f "$cache_file" ]]; then
+      WDA_PORT=$(python3 -c "import json; print(json.load(open('$cache_file')).get('wda_port',''))" 2>/dev/null) || true
+      WDA_SESSION=$(python3 -c "import json; print(json.load(open('$cache_file')).get('wda_session',''))" 2>/dev/null) || true
+    fi
+  else
+    wda_available="false"
+    WDA_PORT=""
+    WDA_SESSION=""
+    echo ""
+    echo "    WDA failed to start — continuing without WDA."
+    echo "    (Expected on iOS versions with WDA SDK mismatch.)"
+    echo "    Screenshot and AX-based commands (describe, wait-for) still work."
+  fi
 
   # ── Step 5: Launch app ───────────────────────────────────────────────────────
 
@@ -3242,11 +3347,20 @@ cmd_setup() {
   echo "── Setup complete ───────────────────────────────────────────────────────────"
   echo "  Simulator:  $SIM_NAME ($SIM_OS)"
   echo "  UDID:       $SIM_UDID"
-  echo "  WDA port:   $WDA_PORT"
-  echo "  WDA session: $WDA_SESSION"
+  if [[ "$wda_available" == "true" ]]; then
+    echo "  WDA port:   $WDA_PORT"
+    echo "  WDA session: $WDA_SESSION"
+    echo "  WDA:        ready"
+  else
+    echo "  WDA:        unavailable (screenshot + AX commands only)"
+  fi
   echo "  App:        $bundle_id"
   echo ""
-  echo "WDA is ready. You can now use tap/swipe/scroll commands."
+  if [[ "$wda_available" == "true" ]]; then
+    echo "WDA is ready. You can now use tap/swipe/scroll commands."
+  else
+    echo "Setup complete (no WDA). Use screenshot/describe/wait-for commands."
+  fi
 }
 
 cmd_screenshot() {
