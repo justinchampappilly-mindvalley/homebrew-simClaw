@@ -13,6 +13,7 @@ class Simclaw < Formula
 
   def install
     bin.install "bin/sim"
+    (share/"simclaw/lib").install Dir["lib/simclaw/*"]
     pkgshare.install "skills"
   end
 

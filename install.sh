@@ -6,7 +6,7 @@
 #
 # What it does:
 #   1. Installs jq if missing (requires Homebrew)
-#   2. Copies sim to /usr/local/bin/sim (or /opt/homebrew/bin/sim on Apple Silicon)
+#   2. Downloads sim and its library modules
 #   3. Makes it executable
 
 set -euo pipefail
@@ -24,7 +24,12 @@ else
   mkdir -p "$INSTALL_DIR"
 fi
 
+# Determine library directory (sibling to bin)
+LIB_DIR="$(dirname "$INSTALL_DIR")/lib/simclaw"
+mkdir -p "$LIB_DIR/swift"
+
 echo "==> Installing sim to $INSTALL_DIR/$SCRIPT_NAME"
+echo "==> Installing library to $LIB_DIR"
 
 # Check for jq
 if ! command -v jq &>/dev/null; then
@@ -38,12 +43,37 @@ if ! command -v jq &>/dev/null; then
   fi
 fi
 
-# Download the script
+# Download the main script
 curl -fsSL "${REPO}/bin/sim" -o "$INSTALL_DIR/$SCRIPT_NAME"
 chmod +x "$INSTALL_DIR/$SCRIPT_NAME"
 
+# Download library modules
+LIB_FILES=(
+  core.sh
+  device.sh
+  coords.sh
+  bootstrap.sh
+  wda.sh
+  layout_map.sh
+  inspect.sh
+  wait.sh
+  nav.sh
+  touch.sh
+  setup.sh
+  type.sh
+  misc.sh
+)
+
+for f in "${LIB_FILES[@]}"; do
+  curl -fsSL "${REPO}/lib/simclaw/$f" -o "$LIB_DIR/$f"
+done
+
+# Download shared Swift helper
+curl -fsSL "${REPO}/lib/simclaw/swift/pickwindow.swift" -o "$LIB_DIR/swift/pickwindow.swift"
+
 echo ""
 echo "sim installed to $INSTALL_DIR/$SCRIPT_NAME"
+echo "Library installed to $LIB_DIR"
 echo ""
 echo "Next steps:"
 echo "  1. Clone WebDriverAgent (one-time):"
