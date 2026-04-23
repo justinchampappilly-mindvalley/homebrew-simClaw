@@ -384,13 +384,12 @@ except: pass
 " 2>/dev/null)
   fi
 
-  [[ -n "$element_id" ]] || die "find-element: '$search_label' not found"
+  if [[ -n "$element_id" ]]; then
+    # Get the element's bounding rect (WDA returns iOS logical coordinates directly)
+    local rect_resp
+    rect_resp=$(curl -s "http://localhost:${WDA_PORT}/session/${WDA_SESSION}/element/${element_id}/rect" 2>/dev/null)
 
-  # Get the element's bounding rect (WDA returns iOS logical coordinates directly)
-  local rect_resp
-  rect_resp=$(curl -s "http://localhost:${WDA_PORT}/session/${WDA_SESSION}/element/${element_id}/rect" 2>/dev/null)
-
-  echo "$rect_resp" | _FIND_LABEL="$search_label" python3 -c "
+    echo "$rect_resp" | _FIND_LABEL="$search_label" python3 -c "
 import sys, json, os
 data = json.load(sys.stdin)
 r = data.get('value', {})
@@ -401,6 +400,83 @@ h = int(r.get('height', 0))
 label = os.environ.get('_FIND_LABEL', '')
 print(json.dumps({'role': 'XCUIElement', 'label': label, 'x': x, 'y': y, 'w': w, 'h': h}))
 " 2>/dev/null || die "find-element: failed to get rect for '$search_label'"
+    return 0
+  fi
+
+  # ── AX-grid fallback ────────────────────────────────────────────────────────
+  # WDA /source didn't include this label. Same gap that hits cmd_tap_element
+  # on system dialogs, swipe-revealed actions, custom toggles like Settings >
+  # Maps > Air Quality Index, etc. Run the same coarse-grid AX hit-test so
+  # find-element returns a usable rect for those elements too. Picks the best
+  # label match (exact > prefix > contains) over interactive + static-text
+  # roles. Static text is included here because find-element is also used as
+  # a "is this label visible?" probe by callers like scroll-to-visible.
+  local lw="${SIM_LOGICAL_W:-402}"
+  local lh="${SIM_LOGICAL_H:-874}"
+  local grid_input=""
+  local gx gy
+  # 40pt step starting at y=20 / x=20. The 20pt offset puts probes in the
+  # MIDDLE of typical 44pt-tall iOS HIG control bands rather than on their
+  # edges; AX hit-test at the exact rect edge sometimes returns the parent
+  # AXGroup instead of the control (we observed this on the Settings root
+  # search field at y=802-840, which AX returns as AXGroup at y=800/840 but
+  # AXTextField at y=820).
+  for ((gy = 20; gy < lh; gy += 40)); do
+    for ((gx = 20; gx < lw; gx += 40)); do
+      grid_input+="$gx $gy"$'\n'
+    done
+  done
+
+  local grid_results
+  grid_results=$(printf '%s' "$grid_input" | _describe_points_batch)
+
+  local needle_lower
+  needle_lower=$(echo "$search_label" | tr '[:upper:]' '[:lower:]')
+  local ax_match
+  ax_match=$(echo "$grid_results" | NEEDLE="$needle_lower" python3 -c "
+import json, os, sys
+needle = os.environ.get('NEEDLE', '')
+ROLES = {'AXButton', 'AXTextField', 'AXSecureTextField', 'AXSearchField',
+         'AXSwitch', 'AXSlider', 'AXLink', 'AXMenuItem', 'AXCheckBox',
+         'AXStaticText'}
+best = None
+best_score = -1
+seen = set()
+for line in sys.stdin:
+    line = line.strip()
+    if not line or line == 'null': continue
+    try: hit = json.loads(line)
+    except Exception: continue
+    if hit.get('role') not in ROLES: continue
+    lbl = (hit.get('label') or '').lower()
+    if not lbl: continue
+    key = (hit.get('role'), lbl, hit.get('x'), hit.get('y'))
+    if key in seen: continue
+    seen.add(key)
+    if lbl == needle: score = 3
+    elif lbl.startswith(needle): score = 2
+    elif needle in lbl: score = 1
+    else: continue
+    if score > best_score:
+        best_score = score
+        best = hit
+if best:
+    print(json.dumps({
+        'role': best.get('role'),
+        'label': best.get('label'),
+        'x': best.get('x', 0),
+        'y': best.get('y', 0),
+        'w': best.get('w', 0),
+        'h': best.get('h', 0),
+    }))
+" 2>/dev/null)
+
+  if [[ -n "$ax_match" ]]; then
+    echo "$ax_match"
+    return 0
+  fi
+
+  die "find-element: '$search_label' not found in WDA /source or in AX grid scan"
 }
 
 cmd_describe_point() {
