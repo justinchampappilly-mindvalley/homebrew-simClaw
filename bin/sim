@@ -435,6 +435,10 @@ case "$CMD" in
     source "$SIM_LIB/misc.sh"
     cmd_health_check
     ;;
+  login)
+    source "$SIM_LIB/login.sh"
+    cmd_login "$@"
+    ;;
   ""|--help|-h)
     usage
     exit 0
