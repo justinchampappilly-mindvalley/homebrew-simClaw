@@ -505,3 +505,131 @@ SWIFTEOF
   fi
   echo "$result"
 }
+
+# _describe_points_batch
+# Hit-test many points in one swift invocation. Reads "logical_x logical_y"
+# pairs from stdin (one per line) and writes one result per line to stdout —
+# either a {role,label,x,y,w,h} JSON object for hits or the literal string
+# "null" for points where AX returned no element.
+#
+# WHY: every cmd_describe_point call pays ~150ms swift cold-start. Calling it
+# in a loop for 50+ points takes ~7s. Batching amortizes the swift startup
+# across all points so the same workload runs in ~300-800ms (200ms startup +
+# ~5-15ms per AX hit-test). Used by layout-map's verify pass.
+#
+# The output is positional — N input lines produce N output lines, even when
+# some hit-tests fail. Callers can zip input and output by line index.
+_describe_points_batch() {
+  _bootstrap
+
+  local sim_orientation
+  sim_orientation=$(plutil -extract "DevicePreferences.${SIM_UDID}.SimulatorWindowOrientation" raw \
+    ~/Library/Preferences/com.apple.iphonesimulator.plist 2>/dev/null || echo "Portrait")
+
+  # Convert each "logical_x logical_y" line on stdin to a "screen_x screen_y"
+  # line in bash before sending to swift. _ios_to_screen handles the orientation
+  # / zoom / origin transform; doing it here keeps the swift script focused on
+  # just the AX hit-test loop. Note: _ios_to_screen prints without a trailing
+  # newline, so we wrap with echo to ensure one line per pair.
+  local screen_pairs
+  screen_pairs=$(while read -r lx ly; do
+    if [[ -z "$lx" || -z "$ly" ]]; then
+      echo ""
+    else
+      echo "$(_ios_to_screen "$lx" "$ly")"
+    fi
+  done)
+
+  # Stage the swift script in a temp file so the input pipe can deliver coord
+  # pairs to swift's stdin (a heredoc on `swift -` would shadow the pipe).
+  local swift_script
+  swift_script=$(mktemp -t sim_describe_batch).swift
+  : > "$swift_script"
+  cat > "$swift_script" << 'SWIFTEOF'
+import ApplicationServices
+import AppKit
+import Foundation
+
+let args = CommandLine.arguments
+let originX     = Double(args[1])!
+let originY     = Double(args[2])!
+let zoom        = Double(args[3])!
+let orientation = args.count > 4 ? args[4] : "Portrait"
+let logicalW    = Double(args.count > 5 ? args[5] : "390") ?? 390.0
+let logicalH    = Double(args.count > 6 ? args[6] : "844") ?? 844.0
+
+guard let simApp = NSWorkspace.shared.runningApplications
+    .first(where: { $0.bundleIdentifier == "com.apple.iphonesimulator" }) else {
+    fputs("ERROR: Simulator not running\n", stderr); exit(1)
+}
+let pid = simApp.processIdentifier
+let axApp = AXUIElementCreateApplication(pid)
+
+func getAttr(_ el: AXUIElement, _ attr: String) -> AnyObject? {
+    var v: CFTypeRef?
+    guard AXUIElementCopyAttributeValue(el, attr as CFString, &v) == .success else { return nil }
+    return v as AnyObject
+}
+func getLabel(_ el: AXUIElement) -> String {
+    for a in ["AXDescription", "AXTitle", "AXLabel", "AXValue"] {
+        if let s = getAttr(el, a) as? String, !s.isEmpty { return s }
+    }
+    return ""
+}
+func getRole(_ el: AXUIElement) -> String {
+    return (getAttr(el, kAXRoleAttribute) as? String) ?? ""
+}
+
+while let line = readLine() {
+    let trimmed = line.trimmingCharacters(in: .whitespaces)
+    if trimmed.isEmpty { print("null"); continue }
+    let parts = trimmed.split(separator: " ")
+    guard parts.count >= 2,
+          let sx = Double(parts[0]),
+          let sy = Double(parts[1]) else {
+        print("null"); continue
+    }
+    var element: AXUIElement?
+    let err = AXUIElementCopyElementAtPosition(axApp, Float(sx), Float(sy), &element)
+    guard err == .success, let el = element else {
+        print("null"); continue
+    }
+    let role  = getRole(el)
+    let label = getLabel(el)
+    var lx = 0, ly = 0, lw = 0, lh = 0
+    if let posVal = getAttr(el, kAXPositionAttribute),
+       let sizeVal = getAttr(el, kAXSizeAttribute) {
+        var pt = CGPoint.zero; var sz = CGSize.zero
+        AXValueGetValue(posVal as! AXValue, .cgPoint, &pt)
+        AXValueGetValue(sizeVal as! AXValue, .cgSize, &sz)
+        let wrx = (Double(pt.x) - originX) / zoom
+        let wry = (Double(pt.y) - originY) / zoom
+        let wrw = Double(sz.width)  / zoom
+        let wrh = Double(sz.height) / zoom
+        switch orientation {
+        case "PortraitUpsideDown":
+            lx = Int(logicalW - wrx - wrw + 0.5); ly = Int(logicalH - wry - wrh + 0.5)
+            lw = Int(wrw + 0.5);                  lh = Int(wrh + 0.5)
+        case "LandscapeLeft":
+            lx = Int(wry + 0.5);                            ly = Int(logicalH - wrx - wrw + 0.5)
+            lw = Int(wrh + 0.5);                            lh = Int(wrw + 0.5)
+        case "LandscapeRight":
+            lx = Int(logicalW - wry - wrh + 0.5);           ly = Int(wrx + 0.5)
+            lw = Int(wrh + 0.5);                            lh = Int(wrw + 0.5)
+        default:
+            lx = Int(wrx + 0.5); ly = Int(wry + 0.5)
+            lw = Int(wrw + 0.5); lh = Int(wrh + 0.5)
+        }
+    }
+    let safeLabel = label
+        .replacingOccurrences(of: "\\", with: "\\\\")
+        .replacingOccurrences(of: "\"", with: "\\\"")
+    print("{\"role\":\"\(role)\",\"label\":\"\(safeLabel)\",\"x\":\(lx),\"y\":\(ly),\"w\":\(lw),\"h\":\(lh)}")
+}
+SWIFTEOF
+
+  printf '%s\n' "$screen_pairs" | swift "$swift_script" \
+    "$SIM_SCREEN_X" "$SIM_SCREEN_Y" "$SIM_ZOOM" "$sim_orientation" \
+    "$SIM_LOGICAL_W" "$SIM_LOGICAL_H" 2>/dev/null
+  rm -f "$swift_script"
+}

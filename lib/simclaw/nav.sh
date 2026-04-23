@@ -96,11 +96,139 @@ PYEOF
   found=$(python3 "$tmp_py" "$label" "$SIM_LOGICAL_W" "$SIM_LOGICAL_H" "$tmp_xml" 2>/dev/null) || true
   rm -f "$tmp_xml" "$tmp_py"
 
-  [[ -n "$found" ]] || die "tap-element: '$label' not found in current viewport"
-
   local cx cy
-  cx=$(echo "$found" | python3 -c "import sys,json; print(json.load(sys.stdin)['cx'])" 2>/dev/null)
-  cy=$(echo "$found" | python3 -c "import sys,json; print(json.load(sys.stdin)['cy'])" 2>/dev/null)
+  if [[ -n "$found" ]]; then
+    cx=$(echo "$found" | python3 -c "import sys,json; print(json.load(sys.stdin)['cx'])" 2>/dev/null)
+    cy=$(echo "$found" | python3 -c "import sys,json; print(json.load(sys.stdin)['cy'])" 2>/dev/null)
+  else
+    # ── AX-grid fallback ────────────────────────────────────────────────────
+    # WDA /source didn't include this label. Common cases that hit this path:
+    #   - System dialogs (notification permission, location prompts) live in
+    #     SpringBoard / system UI overlay, not the foreground app's snapshot.
+    #   - Some XCUIElement subclasses are simply missing from XCUITest's
+    #     snapshot() — e.g., the bottom-right `+` button on Reminders main.
+    #   - Dynamically-injected toolbars or overlays may not be captured yet.
+    #
+    # The AX hit-test path (`describe-point`) sees these elements correctly
+    # because it queries the live macOS AX tree from the simulator window
+    # server. We scan a coarse grid (50pt spacing → ~150 probes for a 4-inch
+    # screen) in one batched call, then pick the best label match. The grid
+    # is sparse enough that a single call finishes in ~1-2s — paid only when
+    # the WDA path missed.
+    local lw="${SIM_LOGICAL_W:-402}"
+    local lh="${SIM_LOGICAL_H:-874}"
+    local grid_input=""
+    local gx gy
+    for ((gy = 50; gy < lh; gy += 50)); do
+      for ((gx = 30; gx < lw; gx += 50)); do
+        grid_input+="$gx $gy"$'\n'
+      done
+    done
+
+    local grid_results
+    grid_results=$(printf '%s' "$grid_input" | _describe_points_batch)
+
+    # Pick the best AX hit whose label matches (case-insensitive contains),
+    # restricted to interactive roles. Preference: exact > prefix > contains.
+    local needle_lower
+    needle_lower=$(echo "$label" | tr '[:upper:]' '[:lower:]')
+    local fallback_match
+    fallback_match=$(echo "$grid_results" | NEEDLE="$needle_lower" python3 -c "
+import json, os, sys
+needle = os.environ.get('NEEDLE', '')
+ROLES = {'AXButton', 'AXTextField', 'AXSecureTextField', 'AXSearchField',
+         'AXSwitch', 'AXSlider', 'AXLink', 'AXMenuItem', 'AXCheckBox'}
+best = None
+best_score = -1
+seen = set()
+for line in sys.stdin:
+    line = line.strip()
+    if not line or line == 'null': continue
+    try: hit = json.loads(line)
+    except Exception: continue
+    if hit.get('role') not in ROLES: continue
+    lbl = (hit.get('label') or '').lower()
+    if not lbl: continue
+    # Dedupe identical hits (the grid often hits the same large element
+    # multiple times) so the scoring isn't biased by element size.
+    key = (hit.get('role'), lbl, hit.get('x'), hit.get('y'))
+    if key in seen: continue
+    seen.add(key)
+    if lbl == needle: score = 3
+    elif lbl.startswith(needle): score = 2
+    elif needle in lbl: score = 1
+    else: continue
+    if score > best_score:
+        best_score = score
+        best = hit
+if best:
+    cx_ = int(best.get('x', 0) + best.get('w', 0) / 2)
+    cy_ = int(best.get('y', 0) + best.get('h', 0) / 2)
+    print(cx_)
+    print(cy_)
+    print(best.get('label', ''))
+" 2>/dev/null)
+
+    if [[ -z "$fallback_match" ]]; then
+      die "tap-element: '$label' not found in WDA /source or in AX grid scan"
+    fi
+
+    local fallback_label
+    { read -r cx; read -r cy; read -r fallback_label; } <<< "$fallback_match"
+    echo "NOTE: '$label' not in WDA /source — found via AX scan as '$fallback_label' at ($cx, $cy)"
+    _wda_tap "$cx" "$cy"
+    echo "OK: tapped $label at ($cx, $cy)"
+    return 0
+  fi
+
+  # ── Verify WDA's reported center against the live AX hit-test ──────────────
+  # XCUITest's snapshot() (which feeds WDA /source) returns layout-intended
+  # frames. SwiftUI flex layouts (Spacer, .frame(maxHeight:.infinity), etc.)
+  # collapse at render time — so an element WDA reports at y=663 may render
+  # at y=460. Tapping at WDA's coords lands in empty space.
+  #
+  # Same two-phase pattern as layout-map's verify pass, scoped to a single
+  # element: hit-test at WDA's center; if mismatch, walk ±300pt in 30pt steps
+  # via one batched describe-points call to find the rendered position.
+  local verify_lbl_lower
+  verify_lbl_lower=$(echo "$label" | tr '[:upper:]' '[:lower:]')
+  local hit_json hit_lbl
+  hit_json=$(cmd_describe_point "$cx" "$cy" 2>/dev/null)
+  hit_lbl=$(echo "$hit_json" | python3 -c "
+import sys, json
+try: print(json.load(sys.stdin).get('label',''))
+except Exception: pass
+" 2>/dev/null)
+  if [[ -z "$hit_lbl" ]] || \
+     ! echo "$hit_lbl" | tr '[:upper:]' '[:lower:]' | grep -qF "$verify_lbl_lower"; then
+    # WDA's center was wrong. Walk ±300pt to find the rendered position.
+    local walk_input walk_results
+    walk_input=$(for off in -30 -60 -90 -120 -150 -180 -210 -240 -270 -300 \
+                            30  60  90 120 150 180 210 240 270 300; do
+      local sy=$((cy + off))
+      [[ "$sy" -lt 50 ]] && echo "" || echo "$cx $sy"
+    done)
+    walk_results=$(printf '%s\n' "$walk_input" | _describe_points_batch)
+    local correction
+    correction=$(echo "$walk_results" | LBL="$verify_lbl_lower" python3 -c "
+import json, os, sys
+needle = os.environ.get('LBL', '')
+for line in sys.stdin:
+    line = line.strip()
+    if not line or line == 'null': continue
+    try: hit = json.loads(line)
+    except Exception: continue
+    if needle in (hit.get('label') or '').lower():
+        x = hit.get('x', 0); y = hit.get('y', 0)
+        w = hit.get('w', 0); h = hit.get('h', 0)
+        print(int(x + w/2), int(y + h/2))
+        sys.exit(0)
+")
+    if [[ -n "$correction" ]]; then
+      read -r cx cy <<< "$correction"
+      echo "NOTE: WDA reported wrong center for '$label' — corrected via AX hit-test to ($cx, $cy)"
+    fi
+  fi
 
   _wda_tap "$cx" "$cy"
   echo "OK: tapped $label at ($cx, $cy)"
