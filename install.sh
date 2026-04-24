@@ -43,11 +43,7 @@ if ! command -v jq &>/dev/null; then
   fi
 fi
 
-# Download the main script
-curl -fsSL "${REPO}/bin/sim" -o "$INSTALL_DIR/$SCRIPT_NAME"
-chmod +x "$INSTALL_DIR/$SCRIPT_NAME"
-
-# Download library modules
+# Library modules to download
 LIB_FILES=(
   core.sh
   device.sh
@@ -62,18 +58,46 @@ LIB_FILES=(
   setup.sh
   type.sh
   misc.sh
+  login.sh
 )
 
+# Bundled Claude Code skills. Each entry is "<skill-name>:<file>" relative to skills/.
+# `sim install-skills` later copies these into ~/.claude/skills/.
+SKILL_FILES=(
+  "qa-branch:SKILL.md"
+)
+
+# Stage skills next to the lib so cmd_install_skills can find them via $SIM_LIB/../skills.
+SKILLS_DIR="$(dirname "$LIB_DIR")/skills"
+
+# Remove existing target before each curl so we don't write through a symlink
+# (e.g. a previous Homebrew install where /opt/homebrew/bin/sim links into the Cellar).
+rm -f "$INSTALL_DIR/$SCRIPT_NAME"
+curl -fsSL "${REPO}/bin/sim" -o "$INSTALL_DIR/$SCRIPT_NAME"
+chmod +x "$INSTALL_DIR/$SCRIPT_NAME"
+
 for f in "${LIB_FILES[@]}"; do
+  rm -f "$LIB_DIR/$f"
   curl -fsSL "${REPO}/lib/simclaw/$f" -o "$LIB_DIR/$f"
 done
 
 # Download shared Swift helper
+rm -f "$LIB_DIR/swift/pickwindow.swift"
 curl -fsSL "${REPO}/lib/simclaw/swift/pickwindow.swift" -o "$LIB_DIR/swift/pickwindow.swift"
+
+# Stage bundled skills so `sim install-skills` can find them post-install.
+rm -rf "$SKILLS_DIR"
+for entry in "${SKILL_FILES[@]}"; do
+  skill_name="${entry%%:*}"
+  skill_file="${entry#*:}"
+  mkdir -p "$SKILLS_DIR/$skill_name"
+  curl -fsSL "${REPO}/skills/$skill_name/$skill_file" -o "$SKILLS_DIR/$skill_name/$skill_file"
+done
 
 echo ""
 echo "sim installed to $INSTALL_DIR/$SCRIPT_NAME"
 echo "Library installed to $LIB_DIR"
+echo "Skills staged at $SKILLS_DIR (run 'sim install-skills' to copy into ~/.claude/skills/)"
 echo ""
 echo "Next steps:"
 echo "  1. Clone WebDriverAgent (one-time):"
